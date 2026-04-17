@@ -11,15 +11,15 @@ typedown gives it types.
 Declare a document's type in frontmatter and author types inline with a
 TypeScript-flavored DSL in ``` ```td ``` fences:
 
-```md
+`````md
 ---
 typedown: Prompt<ReviewInput, ReviewOutput>
 ---
 
 # Code Reviewer
 
-` ``td
-import { Prompt, Example } from "typedown/agents"
+```td
+import { Prompt } from "typedown/agents"
 
 type ReviewInput  = { diff: string, context: string }
 type ReviewOutput = { approved: boolean, comments: Comment[] }
@@ -28,10 +28,11 @@ interface Comment {
   file: string
   line: number
   severity: "nit" | "suggestion" | "blocking"
+  body: string
 }
 
 export type Doc = Prompt<ReviewInput, ReviewOutput>
-` ``
+```
 
 ## Role
 You are a rigorous reviewer…
@@ -40,10 +41,24 @@ You are a rigorous reviewer…
 1. …
 
 ## Examples
+
 ### Example 1
-**Input:** …
-**Output:** …
+
+**Input:**
+
+```json
+{ "diff": "…", "context": "src/auth.ts" }
 ```
+
+**Output:**
+
+```json
+{ "approved": false, "comments": [
+  { "file": "src/auth.ts", "line": 42,
+    "severity": "blocking", "body": "null check missing" }
+] }
+```
+`````
 
 Run `typedown check docs/` and the checker verifies:
 
@@ -51,6 +66,9 @@ Run `typedown check docs/` and the checker verifies:
 - `## Instructions` body is actually an ordered list
 - `## Examples` contains `### Example N` sub-sections
 - each example has `Input:` and `Output:` markers
+- **every `json` / `yaml` value fence in an example is type-checked
+  against the declared `I` / `O`** — wrong primitives, missing required
+  fields, enum violations, malformed JSON all get pinpointed diagnostics
 - no undeclared `##` sections slip in
 
 ## Example
@@ -64,9 +82,9 @@ crates/
   td-core/    diagnostics + spans
   td-ast/     markdown & td-DSL ASTs
   td-parse/   markdown parser + td-DSL parser
-  td-check/   type environment + conformance rules
+  td-check/   type env, conformance rules, value typing, JSON Schema export
   td-stdlib/  built-in types (Section, Prose, Prompt, Tool, Runbook, …)
-  td-cli/     `typedown` binary with miette-rendered diagnostics
+  td-cli/     `typedown` binary: check / types / export subcommands
 ```
 
 ## Usage
