@@ -2,11 +2,175 @@
 
 **Statically typed markdown.** A lint + type checker + contract runtime
 for markdown files aimed at agent-facing documents (prompts, tool specs,
-runbooks, AGENTS.md).
+runbooks, `AGENTS.md`).
 
 Markdown is load-bearing infrastructure for LLMs now, but it's `any`-typed.
-typedown gives it types — and now, through **effect rows**, a capability
-contract that a runtime can enforce.
+typedown gives it types — and through **effect rows**, a capability
+contract that a runtime can enforce and a code generator can compile
+into executable TypeScript.
+
+![typedown CLI output](docs/typedown.png)
+
+---
+
+## Contents
+
+- [Quickstart](#quickstart)
+- [Examples walkthrough](#examples-walkthrough)
+- [Concept](#concept)
+- [Typed example values](#typed-example-values)
+- [Effect rows — prompts as contracts](#effect-rows--prompts-as-contracts)
+- [Typed composition — pipelines](#typed-composition--pipelines-where-io-and-effects-flow-statically)
+- [Compiling to Vercel AI SDK TypeScript](#compiling-to-runtime-code--vercel-ai-sdk)
+- [Runtime enforcement](#runtime-enforcement-td-runtime)
+- [CLI reference](#cli-reference)
+- [Diagnostic codes](#diagnostic-codes)
+- [Stdlib](#stdlib)
+- [Layout](#layout)
+- [Status & roadmap](#status)
+
+---
+
+## Quickstart
+
+**Prerequisites:** Rust 1.80+ (stable). No npm / Node required to build
+typedown — the CLI is a single Rust binary. Node is only needed when you
+want to *run* the TypeScript the AI SDK backend generates.
+
+```sh
+git clone https://github.com/ShayCichocki/typedown
+cd typedown
+
+# Build the CLI (release mode for speed; omit --release while iterating).
+cargo build --release -p td-cli
+
+# Alias for convenience in the rest of this README.
+alias typedown="$(pwd)/target/release/typedown"
+
+# Lint every .md under examples/ — should report 4 files checked,
+# 7 errors and 2 warnings across the two deliberately broken examples.
+typedown check examples/
+```
+
+Or use `cargo run` directly if you don't want an alias:
+
+```sh
+cargo run --release -p td-cli -- check examples/
+```
+
+## Examples walkthrough
+
+Four examples ship in [`examples/`](examples/), in increasing order of
+ambition. Every command below is copy-paste runnable from the repo root.
+
+### 1. `code_reviewer_prompt.md` — typed prompt with effect rows
+
+A single-prompt document declaring `Prompt<ReviewInput, ReviewOutput>`
+intersected with a full capability policy (`Uses`, `Reads`, `Writes`,
+`Model`, `MaxTokens`).
+
+```sh
+# Conformance check — should be clean.
+typedown check examples/code_reviewer_prompt.md
+
+# Print the declared policy.
+typedown effects examples/code_reviewer_prompt.md
+#   uses:       read_file, run_tests
+#   reads:      ./src/**, ./tests/**
+#   writes:     ∅ (deny-all)
+#   model:      claude-opus-4-5, claude-sonnet-4-5
+#   max tokens: 4096
+
+# Export to JSON Schema (with x-typedown-effects vendor extension).
+typedown export examples/code_reviewer_prompt.md -o reviewer.schema.json
+
+# Compile to Vercel AI SDK TypeScript.
+typedown export --format ai-sdk \
+  examples/code_reviewer_prompt.md -o reviewer.ts
+```
+
+The generated `reviewer.ts` is a ~110-line module you can import into
+any Next.js / Node project that has `ai` and `zod` installed:
+
+```ts
+import { codeReviewerPrompt } from "./reviewer";
+const result = await codeReviewerPrompt({ diff, context });
+```
+
+### 2. `code_reviewer_prompt_broken.md` — diagnostic showcase (prompt level)
+
+A deliberately broken variant of the reviewer. Demonstrates four
+diagnostic codes:
+
+```sh
+typedown check examples/code_reviewer_prompt_broken.md
+```
+
+Expected codes: **td502** (value-type mismatch — `"diff": 42` where a
+string is declared), **td502** again (`"approved": "yes"` where a
+boolean is declared), **td504** (extra field in the example output),
+**td601** (malformed effect row — `MaxTokens<"nope">`), **td405**
+(undeclared section).
+
+These are catches the type system makes *before* you ever run the
+prompt — five separate bug classes, pinpointed with miette-rendered
+source spans.
+
+### 3. `support_pipeline.md` — typed pipeline with composition algebra
+
+A two-step pipeline (Classify → Answer) declared via
+`Compose<[Classify, Answer]>`. Each step has its own policy; the
+pipeline's declared effect rows form the ceiling.
+
+```sh
+# Clean — adjacent I/O matches, every child effect fits inside the parent.
+typedown check examples/support_pipeline.md
+
+# Inspect the declared pipeline structure.
+typedown pipeline examples/support_pipeline.md
+# examples/support_pipeline.md — pipeline (2 steps)
+#   [1] Classify
+#       input:      Query
+#       output:     Classification
+#       uses:       ∅ (deny-all)
+#       model:      openai/gpt-4o-mini
+#       max tokens: 512
+#   [2] Answer
+#       input:      Classification
+#       output:     Response
+#       uses:       retrieve_kb
+#       reads:      ./kb/**
+#       model:      anthropic/claude-sonnet-4.5
+#       max tokens: 2048
+
+# Full schema export including x-typedown-pipeline vendor extension.
+typedown export examples/support_pipeline.md | jq .x-typedown-pipeline
+```
+
+### 4. `support_pipeline_broken.md` — composition diagnostic showcase
+
+The broken companion to `support_pipeline.md`. Violates every
+composition rule at once: a step whose output doesn't match the next
+step's input, a step whose `Uses` includes a tool the pipeline never
+authorized, a step using a model not in the pipeline's allowlist, and
+a step requesting more tokens than the pipeline permits.
+
+```sh
+typedown check examples/support_pipeline_broken.md
+```
+
+Expected codes: **td702** (I/O mismatch between adjacent steps),
+**td703** (child `Uses` entry not in parent ceiling), **td704** (child
+`Model` not in parent's allowlist), **td705** (child `MaxTokens`
+exceeds parent). Four type-level bugs caught before execution.
+
+### Clean up
+
+```sh
+rm -f reviewer.schema.json reviewer.ts
+```
+
+---
 
 ## Concept
 
@@ -87,47 +251,11 @@ Run `typedown check docs/` and the checker verifies:
   well-formed — tuple args of the right shape, number literals for
   ceilings, and so on
 
-## Example
-
-![typedown CLI output](docs/typedown.png)
-
-## Layout
-
-```
-crates/
-  td-core/     diagnostics + spans
-  td-ast/      markdown & td-DSL ASTs
-  td-parse/    markdown parser + td-DSL parser
-  td-check/    type env, conformance, value typing, effect rows,
-               pipeline composition, JSON Schema
-  td-stdlib/   built-in types (Section, Prose, Prompt, Tool, Runbook,
-               Uses, Reads, Writes, Model, MaxTokens, Compose, …)
-  td-runtime/  EnforcedPrompt: refuse unauthorized tool calls / reads / writes
-               at runtime from a typed-markdown contract; expose pipeline
-               structure to orchestrators
-  td-codegen/  compile typed docs to runtime code (Vercel AI SDK
-               backend — TypeScript + Zod — today)
-  td-cli/      `typedown` binary: check / types / export / effects / pipeline
-```
-
-## Usage
-
-```sh
-cargo run -p td-cli -- check examples/
-cargo run -p td-cli -- types                             # print stdlib modules
-cargo run -p td-cli -- export examples/foo.md            # JSON Schema → stdout
-cargo run -p td-cli -- export examples/foo.md -o out.json
-cargo run -p td-cli -- export --format ai-sdk examples/foo.md -o foo.ts
-cargo run -p td-cli -- effects examples/foo.md           # print the policy
-cargo run -p td-cli -- effects examples/foo.md --json
-cargo run -p td-cli -- pipeline examples/pipeline.md     # print pipeline steps
-cargo run -p td-cli -- pipeline examples/pipeline.md --json
-```
-
 ## Typed example values
 
-`Example<I, O>` is now load-bearing. Write your examples with `json` or
-`yaml` value fences and typedown type-checks the payloads against `I` / `O`:
+`Example<I, O>` is load-bearing. Write your examples with `json` or
+`yaml` value fences and typedown type-checks the payloads against
+`I` / `O`:
 
 ````md
 ### Example 1
@@ -152,6 +280,45 @@ comments:
 
 Prose-only examples (no value fences) continue to work — value typing is
 strictly opt-in.
+
+## Effect rows — prompts as contracts
+
+A typed prompt's declared type can carry a **capability policy** alongside
+its content shape. Five markers ship in `typedown/agents`:
+
+| marker           | meaning                                                     |
+|------------------|-------------------------------------------------------------|
+| `Uses<T>`        | tuple of tool names this prompt may invoke                  |
+| `Reads<T>`       | tuple of glob patterns this prompt may read                 |
+| `Writes<T>`      | tuple of glob patterns this prompt may write                |
+| `Model<T>`       | tuple or string-union of model identifiers it was validated against |
+| `MaxTokens<N>`   | number literal: hard ceiling the runtime enforces           |
+
+You opt in by intersecting them into the document's declared type:
+
+```ts
+export type Doc =
+  & Prompt<In, Out>
+  & Uses<["read_file", "run_tests"]>
+  & Reads<["./src/**", "./tests/**"]>
+  & Writes<[]>                                  // explicit: cannot write
+  & Model<"claude-opus-4-5" | "claude-sonnet-4-5">
+  & MaxTokens<4096>
+```
+
+Effects flow through every downstream tool:
+
+- `typedown check` validates effect-row arguments (tuples of string
+  literals, numbers for `MaxTokens`, etc.) — malformed rows fire **td601**.
+- `typedown export` emits them as the `x-typedown-effects` vendor
+  extension on the root JSON Schema, so downstream consumers (OpenAPI,
+  provider tool-call specs, etc.) preserve the policy.
+- `typedown effects <file>` prints the declared policy table.
+- `td-runtime`'s `EnforcedPrompt` refuses unauthorized tool calls,
+  reads, writes, models, and over-budget token requests, and validates
+  concrete JSON input/output against `I` and `O`.
+- `typedown export --format ai-sdk` folds the policy into a typed
+  `<Title>Policy` constant in the generated TypeScript module.
 
 ## Typed composition — pipelines where I/O and effects flow statically
 
@@ -199,24 +366,6 @@ export type Pipeline =
 You cannot accidentally compose a subagent that uses a tool the parent
 didn't authorize. The type system refuses before runtime.
 
-Inspect a pipeline with the CLI:
-
-```sh
-typedown pipeline prompts/pipeline.md
-# prompts/pipeline.md — pipeline (2 steps)
-#   [1] Classify
-#       input:      Query
-#       output:     Classification
-#       uses:       ∅ (deny-all)
-#       model:      openai/gpt-4o-mini
-#       max tokens: 512
-#   [2] Answer
-#       input:      Classification
-#       output:     Response
-#       uses:       retrieve_kb
-#       ...
-```
-
 Schema export embeds the full pipeline as an `x-typedown-pipeline`
 vendor extension alongside `x-typedown-effects`, so orchestrators
 (AI SDK codegen, Workflow DevKit, a custom runner) get stepwise I/O +
@@ -240,18 +389,22 @@ import module with:
   allowlist filtering.
 
 ```sh
-typedown export --format ai-sdk prompts/reviewer.md -o generated/reviewer.ts
+typedown export --format ai-sdk examples/code_reviewer_prompt.md \
+  -o generated/reviewer.ts
 ```
 
+Then in your TypeScript project (install `ai` and `zod` if you
+haven't: `pnpm add ai zod`):
+
 ```ts
-// consumer code — three lines
-import { codeReviewerPrompt } from "@/generated/reviewer";
+// three-line consumer
+import { codeReviewerPrompt } from "./generated/reviewer";
 const result = await codeReviewerPrompt({ diff, context });
 ```
 
 The generated module is plain TypeScript — no runtime dependency on
-typedown or Rust. If you've got AI SDK + Zod installed, it works. The
-compile target preserves every constraint the type system verified:
+typedown or Rust. The compile target preserves every constraint the
+type system verified:
 
 * `allowedTools` const is a `readonly` string-literal tuple TypeScript
   can exhaustively check at compile time.
@@ -263,45 +416,10 @@ compile target preserves every constraint the type system verified:
   check`. Shipping TS generated from a broken contract just moves the
   failure downstream.
 
-## Effect rows — prompts as contracts
+## Runtime enforcement (`td-runtime`)
 
-A typed prompt's declared type can carry a **capability policy** alongside
-its content shape. Five markers ship in `typedown/agents`:
-
-| marker           | meaning                                                     |
-|------------------|-------------------------------------------------------------|
-| `Uses<T>`        | tuple of tool names this prompt may invoke                  |
-| `Reads<T>`       | tuple of glob patterns this prompt may read                 |
-| `Writes<T>`      | tuple of glob patterns this prompt may write                |
-| `Model<T>`       | tuple or string-union of model identifiers it was validated against |
-| `MaxTokens<N>`   | number literal: hard ceiling the runtime enforces           |
-
-You opt in by intersecting them into the document's declared type:
-
-```ts
-export type Doc =
-  & Prompt<In, Out>
-  & Uses<["read_file", "run_tests"]>
-  & Reads<["./src/**", "./tests/**"]>
-  & Writes<[]>                                  // explicit: cannot write
-  & Model<"claude-opus-4-5" | "claude-sonnet-4-5">
-  & MaxTokens<4096>
-```
-
-Effects flow all the way through the toolchain:
-
-- `typedown check` validates effect-row arguments (tuples of string
-  literals, numbers for `MaxTokens`, etc.) — malformed rows fire **td601**.
-- `typedown export` emits them as the `x-typedown-effects` vendor
-  extension on the root JSON Schema, so downstream consumers (OpenAPI,
-  provider tool-call specs, etc.) preserve the policy.
-- `typedown effects <file>` prints the declared policy table — useful for
-  quick audits.
-- `td-runtime`'s `EnforcedPrompt` refuses unauthorized tool calls,
-  reads, writes, models, and over-budget token requests, and validates
-  concrete JSON input/output against `I` and `O`.
-
-### Runtime enforcement (`td-runtime`)
+When you want server-side enforcement in Rust rather than compiled-TS,
+use `td-runtime` directly:
 
 ```rust
 use td_runtime::EnforcedPrompt;
@@ -328,6 +446,20 @@ prompt.check_token_limit(4097).unwrap_err();            // over ceiling
 `EnforcedPrompt::load` **refuses to construct** if the doc wouldn't pass
 `typedown check`. Silently enforcing an empty policy on a broken contract
 is a security anti-pattern.
+
+## CLI reference
+
+```sh
+typedown check <paths…>              # lint one or more files / directories
+typedown types                       # print stdlib modules
+typedown effects <file> [--json]     # print the declared policy
+typedown pipeline <file> [--json]    # print pipeline structure
+typedown export <file> [-o <out>]    # JSON Schema (default)
+typedown export --format ai-sdk <file> [-o <out>]
+                                     # Vercel AI SDK TypeScript module
+```
+
+Every command honors `.gitignore` when walking directories.
 
 ## Diagnostic codes
 
@@ -356,7 +488,7 @@ is a security anti-pattern.
 
 ## Stdlib
 
-Two modules ship out of the box:
+Three modules ship out of the box:
 
 - **`typedown/agents`** —
   - Content types: `Prompt<I, O>`, `Tool<A, R>`, `Runbook`, `Example<I, O>`
@@ -369,9 +501,29 @@ Plus implicit content-shape primitives usable without import:
 `Section<T>`, `Prose`, `OrderedList`, `UnorderedList`, `TaskList`,
 `CodeBlock<Lang>`, `Heading<Level>`.
 
+## Layout
+
+```
+crates/
+  td-core/     diagnostics + spans
+  td-ast/      markdown & td-DSL ASTs
+  td-parse/    markdown parser + td-DSL parser
+  td-check/    type env, conformance, value typing, effect rows,
+               pipeline composition, JSON Schema
+  td-stdlib/   built-in types (Section, Prose, Prompt, Tool, Runbook,
+               Uses, Reads, Writes, Model, MaxTokens, Compose, …)
+  td-runtime/  EnforcedPrompt: refuse unauthorized tool calls / reads / writes
+               at runtime from a typed-markdown contract; expose pipeline
+               structure to orchestrators
+  td-codegen/  compile typed docs to runtime code (Vercel AI SDK
+               backend — TypeScript + Zod — today)
+  td-cli/      `typedown` binary: check / types / export / effects / pipeline
+```
+
 ## Status
 
 Shipping today:
+
 - Markdown + td-DSL parsing (intersections, unions, tuples, generics,
   TS-style leading `&` / `|` operators)
 - Generic instantiation & intersection flattening
@@ -379,8 +531,8 @@ Shipping today:
 - **Value typing**: JSON / YAML fences inside `Example<I, O>` are parsed
   and checked against `I` / `O` — generic parameters are no longer phantom
 - **Schema export**: `typedown export` emits JSON Schema (Draft 2020-12)
-  with every local type declaration under `$defs` and effect rows under
-  `x-typedown-effects`
+  with every local type declaration under `$defs`, effect rows under
+  `x-typedown-effects`, and pipelines under `x-typedown-pipeline`
 - **Effect rows**: `Uses<>`, `Reads<>`, `Writes<>`, `Model<>`,
   `MaxTokens<>` intersected into the doc's type declare a capability
   policy surface
@@ -391,18 +543,19 @@ Shipping today:
   calls, reads, writes, models, and over-budget token requests;
   validates concrete JSON I/O against `I` and `O`; exposes pipeline
   structure for orchestrators
-- **`td-codegen`**: `typedown export --format ai-sdk` compiles typed
-  prompts to ready-to-import Vercel AI SDK TypeScript modules (Zod
-  schemas, policy constants, tool allowlist filtering, `generateText`
-  wrapper) — no hand-written boilerplate
+- **`td-codegen` / AI SDK backend**: `typedown export --format ai-sdk`
+  compiles typed prompts to ready-to-import Vercel AI SDK TypeScript
+  modules (Zod schemas, policy constants, tool allowlist filtering,
+  `generateText` wrapper)
 - CLI: `check` / `types` / `export` / `effects` / `pipeline`
+- **126 tests across 8 crates**
 
 Roadmap:
+
 - Pipeline codegen (emit orchestrator functions from `Compose<[…]>`)
 - Additional codegen backends: Workflow DevKit, Anthropic tool JSON,
   OpenAI function specs, Pydantic
 - `td diff` for semver-style compatibility checks between doc versions
-- Additional export targets (`.d.ts`, Zod, OpenAI / Anthropic tool JSON)
 - Reference Anthropic / OpenAI client wrappers that consume `EnforcedPrompt`
 - LSP server (`td-lsp`) for in-editor diagnostics
 - User-authored `.td` modules via import paths
