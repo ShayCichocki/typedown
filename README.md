@@ -47,7 +47,7 @@ cargo build --release -p td-cli
 # Alias for convenience in the rest of this README.
 alias typedown="$(pwd)/target/release/typedown"
 
-# Lint every .md under examples/ — should report 4 files checked,
+# Lint every .md under examples/ — should report 5 files checked,
 # 7 errors and 2 warnings across the two deliberately broken examples.
 typedown check examples/
 ```
@@ -60,7 +60,7 @@ cargo run --release -p td-cli -- check examples/
 
 ## Examples walkthrough
 
-Four examples ship in [`examples/`](examples/), in increasing order of
+Five examples ship in [`examples/`](examples/), in increasing order of
 ambition. Every command below is copy-paste runnable from the repo root.
 
 ### 1. `code_reviewer_prompt.md` — typed prompt with effect rows
@@ -179,10 +179,129 @@ Expected codes: **td702** (I/O mismatch between adjacent steps),
 `Model` not in parent's allowlist), **td705** (child `MaxTokens`
 exceeds parent). Four type-level bugs caught before execution.
 
+### 5. `support_triage.md` + `support_triage.workflow.ts` — production-shape integration with Vercel Workflow SDK
+
+A realistic customer-support triage. Three chonky LLM steps typed by
+typedown (`Classify` → `Draft` → `Review`), plus three external
+fetches orchestrated by [Vercel Workflow SDK](https://workflow-sdk.dev):
+`fetchCustomer`, `fetchOrders`, `searchKb`. The two files compose into
+a single **six-step durable workflow**:
+
+```
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ fetchCustomer   │  │ fetchOrders     │  │ searchKb        │
+│ (workflow-sdk)  │  │ (workflow-sdk)  │  │ (workflow-sdk)  │
+└────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+         └───────────┬────────┴─────────┬──────────┘
+                    ┌▼─────────┐  ┌─────▼──┐  ┌────────┐
+                    │ Classify │→ │ Draft  │→ │ Review │      (typedown)
+                    └──────────┘  └────────┘  └────────┘
+                     (LLM)         (LLM)       (LLM)
+```
+
+The division of labour:
+
+| concern | owner |
+|---|---|
+| LLM I/O schemas + pipeline I/O flow verification | **typedown** |
+| Per-step effect-row policy (tools, models, token caps) | **typedown** |
+| Durable retries, suspension, observability, resumption | **workflow-sdk** |
+| External HTTP / DB / vector fetches | **workflow-sdk** |
+
+Each step in the markdown file has a **~500 word system prompt**
+covering voice, tone, grounding rules, escalation triggers, policy
+rejection conditions, and output-field semantics — genuinely
+production-shape instruction content, not placeholder prose.
+
+```sh
+# Check the typed pipeline.
+typedown check examples/support_triage.md
+
+# Inspect the 3 typedown-owned LLM steps.
+typedown pipeline examples/support_triage.md
+# examples/support_triage.md — pipeline (3 steps)
+#   [1] Classify
+#       input:      TriageInput
+#       output:     Triaged
+#       uses:       ∅ (deny-all)
+#       model:      openai/gpt-4o-mini
+#       max tokens: 1024
+#   [2] Draft
+#       input:      Triaged
+#       output:     Drafted
+#       uses:       search_kb, get_customer_macros
+#       reads:      ./kb/**, ./macros/**
+#       model:      anthropic/claude-sonnet-4.5
+#       max tokens: 4096
+#   [3] Review
+#       input:      Drafted
+#       output:     ReviewResult
+#       ...
+
+# Compile to TypeScript. The output is ~380 lines of fully typed
+# Zod schemas + per-step invocation functions + orchestrator.
+mkdir -p examples/generated
+typedown export --format ai-sdk examples/support_triage.md \
+  -o examples/generated/support_triage.ts
+```
+
+Then the companion
+[`examples/support_triage.workflow.ts`](examples/support_triage.workflow.ts)
+imports the typedown-generated symbols and wraps them in a
+`"use workflow"` durable orchestrator:
+
+```ts
+import {
+  classify, draft, review,
+  type InboundMessage, type ReviewResult,
+} from "./generated/support_triage";
+import { FatalError } from "workflow";
+
+export async function supportTriageWorkflow(
+  message: InboundMessage,
+): Promise<ReviewResult> {
+  "use workflow";
+
+  // 1–3: parallel external fetches, each a durable checkpoint.
+  const [customer, orders, kbArticles] = await Promise.all([
+    fetchCustomer(message.customerId),
+    fetchOrders(message.customerId),
+    searchKb(message.body),
+  ]);
+
+  // 4–6: typedown-verified LLM chain. Type flow was checked at
+  // `typedown check` time, so `triaged → drafted → reviewed` can't
+  // fail a schema check — only the LLM itself can, in which case
+  // workflow-sdk retries automatically.
+  const triaged  = await classifyStep({ message, customer, orders, kbArticles });
+  const drafted  = await draftStep(triaged);
+  const reviewed = await reviewStep(drafted);
+
+  await logToCrm(message.messageId, message.customerId, { triaged, drafted, reviewed });
+  if (reviewed.mustEscalate) await escalateToHuman(message.messageId, message.customerId, reviewed);
+
+  return reviewed;
+}
+```
+
+The companion file is ~280 lines of real orchestration code: CRM and
+billing fetches, vector KB search, PagerDuty escalation, CRM ticket
+logging with idempotency keys, a critical-path short-circuit that
+routes severe escalations straight to a human before paying for the
+draft+review LLM calls. Every external call declares
+`"use step"` so workflow-sdk observes and retries each independently.
+
+**The headline:** typedown and workflow-sdk compose in two lines
+(an `import` and an `await`). typedown types the contracts;
+workflow-sdk types the orchestration; together they describe an
+agent system with compile-time correctness, runtime policy
+enforcement, and durable execution end-to-end.
+
 ### Clean up
 
 ```sh
-rm -f reviewer.schema.json reviewer.ts
+rm -f reviewer.schema.json reviewer.ts support_pipeline.ts
+rm -rf examples/generated
 ```
 
 ---
