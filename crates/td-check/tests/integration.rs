@@ -276,8 +276,8 @@ r.
 #[test]
 fn schema_export_roundtrips_example_shape() {
     let file = SourceFile::new("doc.md", GOOD_TYPED_EXAMPLE.to_string());
-    let (_doc, env, ty, effects, _diags) = resolve_doc_type(&file);
-    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects));
+    let (_doc, env, ty, effects, _composition, _diags) = resolve_doc_type(&file);
+    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects), None);
     assert_eq!(schema["title"], serde_json::json!("Doc"));
     assert_eq!(schema["type"], serde_json::json!("object"));
     // Prompt<In, Out> expands to { role, instructions, examples }.
@@ -290,8 +290,8 @@ fn schema_export_roundtrips_example_shape() {
 #[test]
 fn schema_export_includes_local_defs() {
     let file = SourceFile::new("doc.md", GOOD_TYPED_EXAMPLE.to_string());
-    let (_doc, env, ty, effects, _diags) = resolve_doc_type(&file);
-    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects));
+    let (_doc, env, ty, effects, _composition, _diags) = resolve_doc_type(&file);
+    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects), None);
     let defs = schema["$defs"].as_object().expect("$defs on root");
     // Both user-declared types should surface as usable value schemas.
     let in_schema = &defs["In"];
@@ -352,12 +352,12 @@ fn effect_rows_do_not_break_conformance() {
 #[test]
 fn effects_land_in_exported_schema() {
     let file = SourceFile::new("e.md", PROMPT_WITH_EFFECTS.to_string());
-    let (_doc, env, ty, effects, _diags) = resolve_doc_type(&file);
+    let (_doc, env, ty, effects, _composition, _diags) = resolve_doc_type(&file);
     assert!(effects.declared, "effects should be marked declared");
     assert_eq!(effects.uses, vec!["read_file".to_string(), "run_tests".into()]);
     assert_eq!(effects.writes, Vec::<String>::new());
     assert_eq!(effects.max_tokens, Some(4096));
-    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects));
+    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects), None);
     let x = &schema["x-typedown-effects"];
     assert_eq!(x["uses"], serde_json::json!(["read_file", "run_tests"]));
     assert_eq!(x["reads"], serde_json::json!(["./src/**", "./tests/**"]));

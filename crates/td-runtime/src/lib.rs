@@ -50,8 +50,8 @@ use serde::Serialize;
 use serde_json::Value;
 use td_ast::td::TdType;
 use td_check::{
-    check_source, check_value, resolve_doc_type, to_json_schema, to_subschema, Effects,
-    LookupResult, TypeEnv,
+    check_source, check_value, resolve_doc_type, to_json_schema, to_subschema, Composition,
+    Effects, LookupResult, TypeEnv,
 };
 use td_core::{Diagnostics, SourceFile, Span};
 use thiserror::Error;
@@ -79,6 +79,10 @@ pub struct EnforcedPrompt {
     input_ty: Option<TdType>,
     /// Output type extracted from `Prompt<I, O>`, if present.
     output_ty: Option<TdType>,
+    /// Pipeline structure, if the doc was declared via `Compose<[…]>`.
+    /// Exposes the ordered step list so host runtimes can orchestrate
+    /// each step with its own effect ceiling.
+    composition: Option<Composition>,
 }
 
 impl EnforcedPrompt {
@@ -117,7 +121,7 @@ impl EnforcedPrompt {
         }
 
         // Now it's safe to derive the policy & schemas from the document.
-        let (_doc, env, ty_opt, effects, _diags) = resolve_doc_type(file);
+        let (_doc, env, ty_opt, effects, composition, _diags) = resolve_doc_type(file);
 
         let ty = ty_opt.ok_or(LoadError::NoDocType)?;
 
@@ -138,7 +142,13 @@ impl EnforcedPrompt {
             .and_then(|s| s.to_str())
             .unwrap_or("Doc")
             .to_string();
-        let schema = to_json_schema(&ty, &env, Some(&title), Some(&effects));
+        let schema = to_json_schema(
+            &ty,
+            &env,
+            Some(&title),
+            Some(&effects),
+            composition.as_ref(),
+        );
 
         Ok(Self {
             path: file.path.clone(),
@@ -150,7 +160,23 @@ impl EnforcedPrompt {
             env,
             input_ty,
             output_ty,
+            composition,
         })
+    }
+
+    /// The pipeline structure declared on this prompt, if any.
+    ///
+    /// Returns `Some` for documents declaring `Compose<[…]>`; their
+    /// stepwise I/O + per-step effects are exposed so host runtimes can
+    /// orchestrate (authorize each step against its own ceiling, route
+    /// output between steps, etc.). Single-prompt docs return `None`.
+    pub fn composition(&self) -> Option<&Composition> {
+        self.composition.as_ref()
+    }
+
+    /// Is this a pipeline declaration?
+    pub fn is_pipeline(&self) -> bool {
+        self.composition.is_some()
     }
 
     // -------------------------------------------------------------- getters

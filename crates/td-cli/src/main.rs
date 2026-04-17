@@ -63,6 +63,19 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print the typed pipeline structure declared by `Compose<[…]>`.
+    ///
+    /// For a doc that declares `Compose<[A, B, C]>`, dumps the ordered
+    /// step list with each step's I/O types and per-step effect ceiling.
+    /// Use this to audit pipeline shape, pipe into orchestrators, or
+    /// diff two pipelines during migration.
+    Pipeline {
+        /// Markdown file to inspect.
+        path: PathBuf,
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -78,6 +91,7 @@ fn main() -> ExitCode {
         Cmd::Types => run_types(),
         Cmd::Export { path, format, out } => run_export(path, format, out),
         Cmd::Effects { path, json } => run_effects(path, json),
+        Cmd::Pipeline { path, json } => run_pipeline(path, json),
     }
 }
 
@@ -137,7 +151,7 @@ fn run_export(path: PathBuf, format: ExportFormat, out: Option<PathBuf>) -> Exit
         }
     };
     let file = SourceFile::new(&path, content);
-    let (_doc, env, ty, effects, diagnostics) = resolve_doc_type(&file);
+    let (_doc, env, ty, effects, composition, diagnostics) = resolve_doc_type(&file);
 
     // Hard-fail on diagnostics originating from the type machinery itself
     // (unknown imports, syntax errors in td fences). Rendering the schema
@@ -165,7 +179,13 @@ fn run_export(path: PathBuf, format: ExportFormat, out: Option<PathBuf>) -> Exit
     let rendered = match format {
         ExportFormat::JsonSchema => {
             let title = path.file_stem().and_then(|s| s.to_str()).map(str::to_string);
-            let schema = to_json_schema(&ty, &env, title.as_deref(), Some(&effects));
+            let schema = to_json_schema(
+                &ty,
+                &env,
+                title.as_deref(),
+                Some(&effects),
+                composition.as_ref(),
+            );
             match serde_json::to_string_pretty(&schema) {
                 Ok(s) => s,
                 Err(e) => {
@@ -197,7 +217,7 @@ fn run_effects(path: PathBuf, json: bool) -> ExitCode {
         }
     };
     let file = SourceFile::new(&path, content);
-    let (_doc, _env, _ty, effects, _diags) = resolve_doc_type(&file);
+    let (_doc, _env, _ty, effects, _composition, _diags) = resolve_doc_type(&file);
 
     if json {
         let obj = serde_json::json!({
@@ -243,6 +263,97 @@ fn fmt_list(xs: &[String]) -> String {
         "∅ (deny-all)".to_string()
     } else {
         xs.join(", ")
+    }
+}
+
+fn run_pipeline(path: PathBuf, json: bool) -> ExitCode {
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to read {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let file = SourceFile::new(&path, content);
+    let (_doc, env, _ty, _effects, composition, _diags) = resolve_doc_type(&file);
+
+    let Some(comp) = composition else {
+        println!("{}: not a pipeline (no `Compose<[…]>` declaration)", path.display());
+        return ExitCode::SUCCESS;
+    };
+
+    if json {
+        let schema = serde_json::to_string_pretty(&serde_json::json!({
+            "steps": comp.steps.iter().map(|s| serde_json::json!({
+                "name": s.name,
+                "input": td_check::to_subschema(&s.input, &env),
+                "output": td_check::to_subschema(&s.output, &env),
+                "effects": {
+                    "declared": s.effects.declared,
+                    "uses": s.effects.uses,
+                    "reads": s.effects.reads,
+                    "writes": s.effects.writes,
+                    "model": s.effects.models,
+                    "maxTokens": s.effects.max_tokens,
+                },
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        println!("{schema}");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("{} — pipeline ({} steps)", path.display(), comp.steps.len());
+    for (i, step) in comp.steps.iter().enumerate() {
+        println!("  [{}] {}", i + 1, step.name);
+        println!(
+            "      input:      {}",
+            type_summary(&step.input, &env),
+        );
+        println!(
+            "      output:     {}",
+            type_summary(&step.output, &env),
+        );
+        if step.effects.declared {
+            println!("      uses:       {}", fmt_list(&step.effects.uses));
+            if !step.effects.reads.is_empty() {
+                println!("      reads:      {}", fmt_list(&step.effects.reads));
+            }
+            if !step.effects.writes.is_empty() {
+                println!("      writes:     {}", fmt_list(&step.effects.writes));
+            }
+            if !step.effects.models.is_empty() {
+                println!("      model:      {}", fmt_list(&step.effects.models));
+            }
+            if let Some(n) = step.effects.max_tokens {
+                println!("      max tokens: {n}");
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Render a single-line type preview for the pipeline table.
+///
+/// Consistent with the schema export (a subschema), just pretty-printed
+/// to one line so it fits in a terminal. Tries named-ref → shape; falls
+/// back to a compact JSON-ish rendering for anonymous types.
+fn type_summary(ty: &td_ast::td::TdType, env: &td_check::TypeEnv) -> String {
+    use td_ast::td::TdType;
+    match ty {
+        TdType::NamedRef { name, type_args, .. } if type_args.is_empty() => name.clone(),
+        TdType::NamedRef { name, type_args, .. } => format!(
+            "{name}<{}>",
+            type_args
+                .iter()
+                .map(|a| type_summary(a, env))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => {
+            let schema = td_check::to_subschema(other, env);
+            serde_json::to_string(&schema).unwrap_or_else(|_| "…".into())
+        }
     }
 }
 

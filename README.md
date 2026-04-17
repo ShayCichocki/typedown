@@ -98,23 +98,27 @@ crates/
   td-core/     diagnostics + spans
   td-ast/      markdown & td-DSL ASTs
   td-parse/    markdown parser + td-DSL parser
-  td-check/    type env, conformance, value typing, effect rows, JSON Schema
+  td-check/    type env, conformance, value typing, effect rows,
+               pipeline composition, JSON Schema
   td-stdlib/   built-in types (Section, Prose, Prompt, Tool, Runbook,
-               Uses, Reads, Writes, Model, MaxTokens, …)
+               Uses, Reads, Writes, Model, MaxTokens, Compose, …)
   td-runtime/  EnforcedPrompt: refuse unauthorized tool calls / reads / writes
-               at runtime from a typed-markdown contract
-  td-cli/      `typedown` binary: check / types / export / effects
+               at runtime from a typed-markdown contract; expose pipeline
+               structure to orchestrators
+  td-cli/      `typedown` binary: check / types / export / effects / pipeline
 ```
 
 ## Usage
 
 ```sh
 cargo run -p td-cli -- check examples/
-cargo run -p td-cli -- types                         # print stdlib modules
-cargo run -p td-cli -- export examples/foo.md        # JSON Schema → stdout
+cargo run -p td-cli -- types                             # print stdlib modules
+cargo run -p td-cli -- export examples/foo.md            # JSON Schema → stdout
 cargo run -p td-cli -- export examples/foo.md -o out.json
-cargo run -p td-cli -- effects examples/foo.md       # print the policy
+cargo run -p td-cli -- effects examples/foo.md           # print the policy
 cargo run -p td-cli -- effects examples/foo.md --json
+cargo run -p td-cli -- pipeline examples/pipeline.md     # print pipeline steps
+cargo run -p td-cli -- pipeline examples/pipeline.md --json
 ```
 
 ## Typed example values
@@ -145,6 +149,75 @@ comments:
 
 Prose-only examples (no value fences) continue to work — value typing is
 strictly opt-in.
+
+## Typed composition — pipelines where I/O and effects flow statically
+
+Single prompts are atoms; real agents are graphs of prompts calling
+prompts calling tools. `Compose<[…]>` types that graph end-to-end:
+
+```ts
+import { Prompt, Uses, Model, MaxTokens } from "typedown/agents"
+import { Compose } from "typedown/workflows"
+
+type Classify =
+  & Prompt<Query, Classification>
+  & Uses<[]>
+  & Model<"openai/gpt-4o-mini">
+  & MaxTokens<512>
+
+type Answer =
+  & Prompt<Classification, Response>
+  & Uses<["retrieve_kb"]>
+  & Model<"anthropic/claude-sonnet-4.5">
+  & MaxTokens<2048>
+
+// The pipeline's type is both the plan AND the policy ceiling.
+export type Pipeline =
+  & Compose<[Classify, Answer]>
+  & Uses<["retrieve_kb"]>
+  & Model<"openai/gpt-4o-mini" | "anthropic/claude-sonnet-4.5">
+  & MaxTokens<4096>
+```
+
+`typedown check` verifies:
+
+1. **I/O flow.** `Classify`'s output (`Classification`) must be
+   structurally equivalent to `Answer`'s input. Rename a field, change
+   a type, reorder the steps without updating the adjacent one — you
+   get a pinpointed **td702** on the PR that introduces it.
+2. **Effect-row algebra.** Every child's effects must fit inside the
+   pipeline's declared ceiling:
+   - `∪ child.Uses   ⊆ parent.Uses`   (**td703**)
+   - `∪ child.Reads  ⊆ parent.Reads`  (**td703**)
+   - `∪ child.Writes ⊆ parent.Writes` (**td703**)
+   - each `child.Model  ⊆ parent.Model` (**td704**)
+   - each `child.MaxTokens ≤ parent.MaxTokens` (**td705**)
+
+You cannot accidentally compose a subagent that uses a tool the parent
+didn't authorize. The type system refuses before runtime.
+
+Inspect a pipeline with the CLI:
+
+```sh
+typedown pipeline prompts/pipeline.md
+# prompts/pipeline.md — pipeline (2 steps)
+#   [1] Classify
+#       input:      Query
+#       output:     Classification
+#       uses:       ∅ (deny-all)
+#       model:      openai/gpt-4o-mini
+#       max tokens: 512
+#   [2] Answer
+#       input:      Classification
+#       output:     Response
+#       uses:       retrieve_kb
+#       ...
+```
+
+Schema export embeds the full pipeline as an `x-typedown-pipeline`
+vendor extension alongside `x-typedown-effects`, so orchestrators
+(AI SDK codegen, Workflow DevKit, a custom runner) get stepwise I/O +
+per-step policy in one document.
 
 ## Effect rows — prompts as contracts
 
@@ -231,6 +304,11 @@ is a security anti-pattern.
 | td502  | error    | value does not match declared type               |
 | td504  | warning  | value has extra field not declared in the type   |
 | td601  | error    | malformed effect row (bad argument shape)        |
+| td701  | error    | pipeline step doesn't resolve to `Prompt<I, O>`  |
+| td702  | error    | pipeline I/O mismatch (Out[N] ≠ In[N+1])         |
+| td703  | error    | child Uses/Reads/Writes not in pipeline ceiling  |
+| td704  | error    | child `Model<>` not in pipeline's model set      |
+| td705  | error    | child `MaxTokens<>` exceeds pipeline ceiling     |
 
 ## Stdlib
 
@@ -240,6 +318,8 @@ Two modules ship out of the box:
   - Content types: `Prompt<I, O>`, `Tool<A, R>`, `Runbook`, `Example<I, O>`
   - Effect rows: `Uses<T>`, `Reads<T>`, `Writes<T>`, `Model<T>`, `MaxTokens<N>`
 - **`typedown/docs`** — `Readme`, `AgentsMd`
+- **`typedown/workflows`** — `Compose<Steps>`, `Sequential<Steps>`
+  (typed multi-step pipelines with effect-row algebra)
 
 Plus implicit content-shape primitives usable without import:
 `Section<T>`, `Prose`, `OrderedList`, `UnorderedList`, `TaskList`,
@@ -260,12 +340,17 @@ Shipping today:
 - **Effect rows**: `Uses<>`, `Reads<>`, `Writes<>`, `Model<>`,
   `MaxTokens<>` intersected into the doc's type declare a capability
   policy surface
+- **Typed composition**: `Compose<[A, B, C]>` statically checks
+  adjacent-step I/O flow AND enforces effect-row subset algebra so
+  children must fit inside the pipeline's ceiling
 - **`td-runtime`**: `EnforcedPrompt::load` refuses unauthorized tool
   calls, reads, writes, models, and over-budget token requests;
-  validates concrete JSON I/O against `I` and `O`
-- CLI with miette diagnostics: `check` / `types` / `export` / `effects`
+  validates concrete JSON I/O against `I` and `O`; exposes pipeline
+  structure for orchestrators
+- CLI: `check` / `types` / `export` / `effects` / `pipeline`
 
 Roadmap:
+- AI SDK / Workflow DevKit / Anthropic tool JSON compile targets
 - `td diff` for semver-style compatibility checks between doc versions
 - Additional export targets (`.d.ts`, Zod, OpenAI / Anthropic tool JSON)
 - Reference Anthropic / OpenAI client wrappers that consume `EnforcedPrompt`

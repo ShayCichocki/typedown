@@ -78,13 +78,14 @@ pub fn module_source(path: &str) -> Option<&'static str> {
     match path {
         "typedown/agents" => Some(AGENTS_SRC),
         "typedown/docs" => Some(DOCS_SRC),
+        "typedown/workflows" => Some(WORKFLOWS_SRC),
         _ => None,
     }
 }
 
 /// List every stdlib module path.
 pub fn module_paths() -> &'static [&'static str] {
-    &["typedown/agents", "typedown/docs"]
+    &["typedown/agents", "typedown/docs", "typedown/workflows"]
 }
 
 /// Every symbol exported by built-in module sources, keyed by symbol name.
@@ -223,6 +224,57 @@ export type AgentsMd = {
   tools: Section<UnorderedList | Prose>
   examples: Section<Prose>
 }
+"#;
+
+const WORKFLOWS_SRC: &str = r#"
+// Composition combinators for multi-step agent workflows.
+//
+// These types describe how individual `Prompt<I, O>` declarations compose
+// into a typed pipeline. The checker treats them as meta — they are
+// harvested by a dedicated pass (`td-check::compose`) which verifies:
+//
+//   * Each step resolves to a `Prompt<I, O>` shape.
+//   * Adjacent steps' I/O line up: output(step N) = input(step N+1).
+//   * Effect rows compose by subset:
+//       union(child.Uses)   ⊆ parent.Uses
+//       union(child.Reads)  ⊆ parent.Reads
+//       union(child.Writes) ⊆ parent.Writes
+//       child.Model         ⊆ parent.Model     (for each step)
+//       child.MaxTokens     ≤ parent.MaxTokens (for each step)
+//
+// The parent's effect rows are *authoritative* — they're the ceiling a
+// pipeline is permitted to operate within. Children must fit. This gives
+// you type-level policy composition: you cannot accidentally widen an
+// agent's capabilities by pulling in a subagent that uses a tool the
+// parent didn't authorize.
+//
+// Example:
+//
+//   type Classify = Prompt<Query, Class>
+//     & Uses<[]>
+//     & Model<"openai/gpt-4o-mini">
+//
+//   type Answer = Prompt<Class, Response>
+//     & Uses<["retrieve"]>
+//     & Model<"anthropic/claude-sonnet-4.5">
+//
+//   export type Pipeline =
+//     & Compose<[Classify, Answer]>
+//     & Uses<["retrieve"]>
+//     & Model<"openai/gpt-4o-mini" | "anthropic/claude-sonnet-4.5">
+//     & MaxTokens<4096>
+
+/// Sequential composition of typed prompts.
+///
+/// `Compose<[A, B, C]>` declares that a pipeline runs A, then B, then C,
+/// with the output of each step feeding the input of the next. The
+/// pipeline's implicit I/O is `Prompt<A.Input, C.Output>`. Steps are
+/// named type references (`Prompt<…> & …` declarations) rather than
+/// inline Prompt literals so they can be type-checked and reused.
+export type Compose<Steps> = any
+
+/// Alias for `Compose` matching the Anthropic / Vercel AI SDK naming.
+export type Sequential<Steps> = any
 "#;
 
 #[cfg(test)]

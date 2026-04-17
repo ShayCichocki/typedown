@@ -25,28 +25,33 @@ use serde_json::{json, Map, Value};
 use td_ast::td::{TdObjectType, TdPrim, TdType};
 use td_stdlib::Builtin;
 
+use crate::compose::Composition;
 use crate::effects::Effects;
 use crate::env::{EntryOrigin, LookupResult, TypeEnv};
 
 /// Render a type as a standalone JSON Schema document.
 ///
 /// The returned `Value` includes `$schema`, optional `title`, `$defs` for
-/// every user-declared type, and — when non-empty — an `x-typedown-effects`
-/// vendor extension carrying the prompt's declared policy (tools, reads,
-/// writes, model, token ceiling).
+/// every user-declared type, and — when non-empty — vendor extensions:
+///
+/// * `x-typedown-effects` — the declared policy (tools, reads, writes,
+///   model, token ceiling).
+/// * `x-typedown-pipeline` — stepwise I/O schemas and per-step effects
+///   for documents declared via `Compose<[…]>`.
 ///
 /// Vendor extensions are legal JSON Schema (`x-*` is reserved for them);
-/// consumers that don't understand them preserve them untouched. That's
-/// exactly what we want — effects flow through bundlers, validators, and
+/// consumers that don't understand them preserve them untouched — so
+/// effects and pipeline structure flow through bundlers, validators, and
 /// provider-spec generators without losing fidelity.
 ///
 /// Use [`to_subschema`] when embedding inside a larger schema; only the
-/// root should carry `$schema`, `title`, `$defs`, and `x-typedown-effects`.
+/// root should carry `$schema`, `title`, `$defs`, and the `x-*` rows.
 pub fn to_json_schema(
     ty: &TdType,
     env: &TypeEnv,
     title: Option<&str>,
     effects: Option<&Effects>,
+    composition: Option<&Composition>,
 ) -> Value {
     let mut schema = to_subschema(ty, env);
 
@@ -74,8 +79,49 @@ pub fn to_json_schema(
                 map.insert("x-typedown-effects".into(), effects_schema(fx));
             }
         }
+        if let Some(comp) = composition {
+            map.insert("x-typedown-pipeline".into(), pipeline_schema(comp, env));
+        }
     }
     schema
+}
+
+/// Serialize a [`Composition`] record to the JSON Schema vendor-extension form.
+///
+/// Emits an array of steps where each step carries:
+/// * `name` — the type-alias name (or positional "step N")
+/// * `input` / `output` — JSON Schema fragments of the step's I/O types
+/// * `effects` — per-step policy (tool allowlist, token ceiling, etc.)
+///
+/// Downstream orchestrators (an AI-SDK codegen, an Anthropic agent harness,
+/// Vercel's Workflow DevKit, a custom runner) can read this shape to
+/// orchestrate the pipeline while enforcing the effect ceiling at every
+/// step.
+fn pipeline_schema(comp: &Composition, env: &TypeEnv) -> Value {
+    let steps: Vec<Value> = comp
+        .steps
+        .iter()
+        .map(|step| {
+            let mut m = Map::new();
+            m.insert("name".into(), Value::String(step.name.clone()));
+            m.insert("input".into(), to_subschema(&step.input, env));
+            m.insert("output".into(), to_subschema(&step.output, env));
+            if step.effects.declared {
+                m.insert("effects".into(), effects_schema(&step.effects));
+            }
+            Value::Object(m)
+        })
+        .collect();
+
+    let mut map = Map::new();
+    map.insert("steps".into(), Value::Array(steps));
+    if let Some(input) = &comp.input {
+        map.insert("input".into(), to_subschema(input, env));
+    }
+    if let Some(output) = &comp.output {
+        map.insert("output".into(), to_subschema(output, env));
+    }
+    Value::Object(map)
 }
 
 /// Serialize an [`Effects`] record to the JSON Schema vendor-extension form.
@@ -385,7 +431,7 @@ mod tests {
     #[test]
     fn root_schema_has_metadata() {
         let env = env_from("type T = { x: string }");
-        let s = to_json_schema(&type_of(&env, "T"), &env, Some("Doc"), None);
+        let s = to_json_schema(&type_of(&env, "T"), &env, Some("Doc"), None, None);
         assert_eq!(s["title"], json!("Doc"));
         assert_eq!(
             s["$schema"],
@@ -408,7 +454,13 @@ mod tests {
             max_tokens: Some(4096),
             declared: true,
         };
-        let s = to_json_schema(&type_of(&env, "T"), &env, Some("Doc"), Some(&fx));
+        let s = to_json_schema(
+            &type_of(&env, "T"),
+            &env,
+            Some("Doc"),
+            Some(&fx),
+            None,
+        );
         let x = &s["x-typedown-effects"];
         assert_eq!(x["uses"], json!(["read_file", "run_tests"]));
         assert_eq!(x["reads"], json!(["./src/**"]));
