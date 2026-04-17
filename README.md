@@ -145,6 +145,21 @@ typedown pipeline examples/support_pipeline.md
 
 # Full schema export including x-typedown-pipeline vendor extension.
 typedown export examples/support_pipeline.md | jq .x-typedown-pipeline
+
+# Compile the pipeline to a typed orchestrator function.
+typedown export --format ai-sdk \
+  examples/support_pipeline.md -o support_pipeline.ts
+```
+
+The generated `support_pipeline.ts` exposes per-step invocations
+(`classify`, `answer`) AND an orchestrator that sequences them with
+statically-typed I/O flow:
+
+```ts
+import { supportPipeline } from "./support_pipeline";
+const response = await supportPipeline({ text, customerId });
+// Internally: classify(input) → answer(classification) — each step's
+// schemas and policy are enforced at its own boundary.
 ```
 
 ### 4. `support_pipeline_broken.md` — composition diagnostic showcase
@@ -374,8 +389,11 @@ per-step policy in one document.
 ## Compiling to runtime code — Vercel AI SDK
 
 Typedown documents compile to executable TypeScript targeting the
-[Vercel AI SDK](https://ai-sdk.dev). One `.md` file becomes a ready-to-
-import module with:
+[Vercel AI SDK](https://ai-sdk.dev). The backend handles two shapes:
+
+### Single prompts
+
+`Prompt<I, O>` docs become a ready-to-import module with:
 
 * A **Zod schema** and inferred TypeScript type for every declared
   value-shape type (topologically sorted so forward references are
@@ -393,14 +411,53 @@ typedown export --format ai-sdk examples/code_reviewer_prompt.md \
   -o generated/reviewer.ts
 ```
 
-Then in your TypeScript project (install `ai` and `zod` if you
-haven't: `pnpm add ai zod`):
-
 ```ts
-// three-line consumer
 import { codeReviewerPrompt } from "./generated/reviewer";
 const result = await codeReviewerPrompt({ diff, context });
 ```
+
+### Pipelines
+
+`Compose<[…]>` docs become a module with **one invocation function
+per step** plus a **typed orchestrator** that chains them:
+
+```sh
+typedown export --format ai-sdk examples/support_pipeline.md \
+  -o generated/support_pipeline.ts
+```
+
+```ts
+import { supportPipeline, classify, answer } from "./generated/support_pipeline";
+
+// Run the full pipeline:
+const response = await supportPipeline({ text, customerId });
+
+// Or drive individual steps directly — still with full type safety:
+const classification = await classify({ text, customerId });
+const answered = await answer(classification);
+```
+
+The orchestrator reads like hand-written code:
+
+```ts
+export async function supportPipeline(
+  input: Query,
+  options?: { tools?: Record<string, Tool>; abortSignal?: AbortSignal },
+): Promise<Response> {
+  const step1Out = await classify(input, options);
+  const step2Out = await answer(step1Out, options);
+  return step2Out;
+}
+```
+
+Each step's system prompt is bucketed from the markdown body by
+matching level-2 headings against the step's type-alias name (case-
+insensitive substring, longest-name wins). `## Step 1 — Classify`
+feeds the `Classify` step; `## Step 2 — Answer` feeds `Answer`; an
+unmatched step gets an empty system prompt plus a comment noting the
+gap so the author can fix the doc.
+
+### Guarantees
 
 The generated module is plain TypeScript — no runtime dependency on
 typedown or Rust. The compile target preserves every constraint the
@@ -412,6 +469,9 @@ type system verified:
   defaulting to the first member.
 * `Writes<[]>` emits `writes: []` — the same deny-all signal the
   runtime honors.
+* Pipeline orchestrators chain steps in declared order; because
+  adjacent-step I/O was verified at `typedown check` time (td702), no
+  runtime validation is needed between steps.
 * Codegen **refuses to run** if the document wouldn't pass `typedown
   check`. Shipping TS generated from a broken contract just moves the
   failure downstream.
@@ -544,15 +604,15 @@ Shipping today:
   validates concrete JSON I/O against `I` and `O`; exposes pipeline
   structure for orchestrators
 - **`td-codegen` / AI SDK backend**: `typedown export --format ai-sdk`
-  compiles typed prompts to ready-to-import Vercel AI SDK TypeScript
-  modules (Zod schemas, policy constants, tool allowlist filtering,
-  `generateText` wrapper)
+  compiles typed prompts AND typed pipelines to ready-to-import
+  Vercel AI SDK TypeScript modules (Zod schemas, policy constants,
+  tool allowlist filtering, `generateText` wrapper, and — for
+  pipelines — per-step invocations plus a typed orchestrator)
 - CLI: `check` / `types` / `export` / `effects` / `pipeline`
 - **126 tests across 8 crates**
 
 Roadmap:
 
-- Pipeline codegen (emit orchestrator functions from `Compose<[…]>`)
 - Additional codegen backends: Workflow DevKit, Anthropic tool JSON,
   OpenAI function specs, Pydantic
 - `td diff` for semver-style compatibility checks between doc versions

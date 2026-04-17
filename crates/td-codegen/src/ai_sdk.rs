@@ -19,21 +19,31 @@
 //!
 //! ## Scope
 //!
-//! v1 supports **single-prompt** documents declared with `Prompt<I, O>`
-//! (optionally intersected with effect rows). Pipeline docs declared
-//! via `Compose<[…]>` are flagged as unsupported — they'll follow in a
-//! subsequent commit that emits a typed orchestrator function calling
-//! each step's generated invocation.
+//! Two document shapes compile today:
+//!
+//! * **Single-prompt** docs declared with `Prompt<I, O>` (optionally
+//!   intersected with effect rows) → one Zod schema per local type,
+//!   a policy const, system prompt, and an async invocation function.
+//!
+//! * **Pipeline** docs declared via `Compose<[A, B, C]>` → per-step
+//!   policy / system / invocation functions, a pipeline-level policy
+//!   ceiling, and an orchestrator function that sequences the steps
+//!   with the type-checker's I/O flow statically proven. Each step's
+//!   system prompt is bucketed from the markdown body by matching
+//!   level-2 headings against the step type-alias names.
+//!
+//! Unsupported doc shapes (e.g. `Readme`, `Tool<A, R>`) produce a
+//! clean [`CodegenError::UnsupportedShape`] with a descriptive reason.
 
 use std::fmt::Write as _;
 
 use td_ast::td::TdType;
-use td_check::{Effects, EntryOrigin, LookupResult, TypeEnv};
+use td_check::{ComposedStep, Composition, Effects, EntryOrigin, LookupResult, TypeEnv};
 use td_core::SourceFile;
 
 use crate::{
-    naming::{camel_case_from_path, pascal_case_from_path},
-    prompt::system_prompt,
+    naming::{camel_case_from_path, pascal_case, pascal_case_from_path},
+    prompt::{pipeline_step_prompts, system_prompt},
     zod::{emit_zod, js_string},
     CodegenError, CompileUnit,
 };
@@ -44,17 +54,17 @@ const BACKEND: &str = "ai-sdk";
 ///
 /// Returns the full source of a `.ts` file. Callers write it to disk or
 /// pipe it to stdout — this function never touches the filesystem.
+///
+/// Dispatches based on whether the document is a typed pipeline
+/// (`Compose<[…]>`) or a single prompt.
 pub fn emit(unit: &CompileUnit<'_>) -> Result<String, CodegenError> {
-    // Pipeline codegen is a v2 scope item.
-    if unit.composition.is_some() {
-        return Err(CodegenError::UnsupportedShape {
-            backend: BACKEND,
-            shape: "Compose<[…]> pipeline".to_string(),
-            reason: "pipeline codegen is not yet supported; v1 emits single-prompt modules"
-                .to_string(),
-        });
+    match unit.composition {
+        Some(comp) => emit_pipeline(unit, comp),
+        None => emit_single_prompt(unit),
     }
+}
 
+fn emit_single_prompt(unit: &CompileUnit<'_>) -> Result<String, CodegenError> {
     let doc_type = unit.doc_type.ok_or(CodegenError::MissingDocType)?;
 
     // Find the Prompt<I, O> inside the doc type. Unlike td-runtime we
@@ -73,33 +83,287 @@ pub fn emit(unit: &CompileUnit<'_>) -> Result<String, CodegenError> {
     };
 
     let mut out = String::new();
+    let title = pascal_case_from_path(&unit.file.path);
+    let fn_name = camel_case_from_path(&unit.file.path);
 
     write_header(&mut out, unit.file);
     writeln!(&mut out).unwrap();
     write_imports(&mut out);
     writeln!(&mut out).unwrap();
     write_local_schemas(&mut out, unit.env)?;
-    write_doc_io_aliases(
-        &mut out,
-        unit.env,
-        &input_ty,
-        &output_ty,
-        &pascal_case_from_path(&unit.file.path),
-    )?;
-    write_policy(&mut out, unit.effects, &pascal_case_from_path(&unit.file.path));
+    write_io_alias_if_needed(&mut out, unit.env, &input_ty, &format!("{title}Input"))?;
+    write_io_alias_if_needed(&mut out, unit.env, &output_ty, &format!("{title}Output"))?;
+    write_policy(&mut out, unit.effects, &title);
     writeln!(&mut out).unwrap();
-    write_system_prompt(&mut out, unit, &pascal_case_from_path(&unit.file.path));
+    write_system_prompt_const(&mut out, &title, &system_prompt(unit.file, unit.doc));
     writeln!(&mut out).unwrap();
     write_invoke_function(
         &mut out,
-        unit,
-        &camel_case_from_path(&unit.file.path),
-        &pascal_case_from_path(&unit.file.path),
+        &fn_name,
+        &title,
+        unit.effects,
         &input_ty,
         &output_ty,
     )?;
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline emitter
+// ---------------------------------------------------------------------------
+
+/// Compile a pipeline document (declared via `Compose<[…]>`) to a
+/// TypeScript module that emits:
+///
+/// 1. Shared Zod schemas for every value-shape local type.
+/// 2. For each pipeline step: a `<Step>Policy` const, `<Step>System`
+///    template string (bucketed from the markdown body by heading),
+///    and a `<step>()` invocation function typed `In → Out` for that
+///    step.
+/// 3. A `<Pipeline>Policy` const documenting the declared ceiling.
+/// 4. An async orchestrator `<pipeline>(input, options?): Promise<Out>`
+///    that chains the step calls with type-checked I/O flow.
+///
+/// The orchestrator is a straight sequence — one `await` per step —
+/// because `typedown check` already verified adjacent-step I/O match
+/// (td702). No runtime shape check is needed between steps.
+fn emit_pipeline(
+    unit: &CompileUnit<'_>,
+    comp: &Composition,
+) -> Result<String, CodegenError> {
+    if comp.steps.is_empty() {
+        return Err(CodegenError::UnsupportedShape {
+            backend: BACKEND,
+            shape: "Compose<[]> (empty)".to_string(),
+            reason: "pipeline has no steps to compile".to_string(),
+        });
+    }
+
+    let mut out = String::new();
+    let pipeline_title = pascal_case_from_path(&unit.file.path);
+    let pipeline_fn_name = camel_case_from_path(&unit.file.path);
+
+    write_header(&mut out, unit.file);
+    writeln!(&mut out).unwrap();
+    write_imports(&mut out);
+    writeln!(&mut out).unwrap();
+    write_local_schemas(&mut out, unit.env)?;
+
+    // Bucket the markdown body into per-step system prompts. Step names
+    // are the `ComposedStep::name` values (the type-alias identifiers
+    // referenced from `Compose<[Classify, Answer]>`).
+    let step_names: Vec<String> = comp.steps.iter().map(|s| s.name.clone()).collect();
+    let step_system_prompts = pipeline_step_prompts(unit.file, unit.doc, &step_names);
+
+    // Emit each step's policy + system + invoke function.
+    for step in &comp.steps {
+        write_step_block(&mut out, unit.env, step, &step_system_prompts)?;
+    }
+
+    // Pipeline-level policy (the ceiling — documented here for
+    // auditability; the per-step consts are what the runtime actually
+    // threads through `generateText`).
+    write_pipeline_policy(&mut out, unit.effects, &pipeline_title);
+    writeln!(&mut out).unwrap();
+
+    // Orchestrator function: sequences the step invocations with
+    // statically-typed I/O flow.
+    write_pipeline_orchestrator(&mut out, &pipeline_fn_name, &pipeline_title, &comp.steps);
+
+    Ok(out)
+}
+
+/// Emit the policy + system + invocation function trio for a single
+/// pipeline step. The step's system prompt comes from the per-heading
+/// bucketing done by [`pipeline_step_prompts`]; if no heading matched
+/// the step's type-alias name, we emit a comment noting the gap so
+/// the author can fix the doc.
+fn write_step_block(
+    out: &mut String,
+    env: &TypeEnv,
+    step: &ComposedStep,
+    step_system_prompts: &std::collections::HashMap<String, String>,
+) -> Result<(), CodegenError> {
+    let step_title = pascal_case(&step.name);
+    let step_fn_name = lower_first(&step_title);
+
+    let system_body = step_system_prompts
+        .get(&step.name)
+        .cloned()
+        .unwrap_or_default();
+
+    writeln!(out, "// ── Step: {} ──", step.name).unwrap();
+    writeln!(out).unwrap();
+
+    // Synthesize I/O schema names *per step* for inline types. When the
+    // step's I/O is a NamedRef (the common case), these calls are no-ops
+    // and the existing local schema is reused.
+    write_io_alias_if_needed(
+        out,
+        env,
+        &step.input,
+        &format!("{step_title}Input"),
+    )?;
+    write_io_alias_if_needed(
+        out,
+        env,
+        &step.output,
+        &format!("{step_title}Output"),
+    )?;
+
+    write_policy(out, &step.effects, &step_title);
+    writeln!(out).unwrap();
+
+    if system_body.is_empty() {
+        writeln!(
+            out,
+            "/// No `##` heading matched step `{}`; the model will run\n\
+             /// with an empty system prompt. Add a heading whose text\n\
+             /// contains `{}` to supply its instructions.",
+            step.name, step.name
+        )
+        .unwrap();
+    }
+    write_system_prompt_const(out, &step_title, &system_body);
+    writeln!(out).unwrap();
+
+    write_invoke_function(
+        out,
+        &step_fn_name,
+        &step_title,
+        &step.effects,
+        &step.input,
+        &step.output,
+    )?;
+    writeln!(out).unwrap();
+
+    Ok(())
+}
+
+/// Render the pipeline-level policy as a commented `<Pipeline>Policy`
+/// constant. This mirrors `write_policy` but tags the comment so
+/// consumers know this is the *ceiling* rather than a per-step record.
+fn write_pipeline_policy(out: &mut String, effects: &Effects, title: &str) {
+    writeln!(
+        out,
+        "/// Pipeline-level capability ceiling — every step's declared\n\
+         /// policy is verified at `typedown check` time to fit inside\n\
+         /// this envelope. Emitted here for auditability; the per-step\n\
+         /// policy constants are what `generateText` actually receives."
+    )
+    .unwrap();
+    if !effects.declared {
+        writeln!(out, "export const {title}Policy = {{}} as const;").unwrap();
+        return;
+    }
+    writeln!(out, "export const {title}Policy = {{").unwrap();
+    if !effects.models.is_empty() {
+        writeln!(
+            out,
+            "  allowedModels: {} as const,",
+            render_string_array(&effects.models)
+        )
+        .unwrap();
+    }
+    if let Some(max) = effects.max_tokens {
+        writeln!(out, "  maxOutputTokens: {max},").unwrap();
+    }
+    writeln!(
+        out,
+        "  allowedTools: {} as const,",
+        render_string_array(&effects.uses)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  reads: {} as const,",
+        render_string_array(&effects.reads)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  writes: {} as const,",
+        render_string_array(&effects.writes)
+    )
+    .unwrap();
+    writeln!(out, "}} as const;").unwrap();
+}
+
+/// Emit the pipeline's orchestrator function. Each step reads from the
+/// previous step's output variable; the final step's output is
+/// returned. All seams are statically typed because each step's
+/// function signature (emitted above) carries explicit `In`/`Out`
+/// types that typedown already verified flow cleanly from one to the
+/// next.
+fn write_pipeline_orchestrator(
+    out: &mut String,
+    pipeline_fn_name: &str,
+    pipeline_title: &str,
+    steps: &[ComposedStep],
+) {
+    // Safe because emit_pipeline rejected empty pipelines upstream.
+    let first = steps.first().expect("non-empty steps");
+    let last = steps.last().expect("non-empty steps");
+
+    let input_ts = ts_ref_for(&first.input, &format!("{pipeline_title}Input"));
+    let output_ts = ts_ref_for(&last.output, &format!("{pipeline_title}Output"));
+
+    writeln!(
+        out,
+        "/// Orchestrate the `{pipeline_title}` pipeline end-to-end.\n\
+         ///\n\
+         /// Each step's I/O match was verified at `typedown check` time\n\
+         /// (td702), so the chain is statically sound. The `options`\n\
+         /// argument is forwarded to every step; per-step tool allowlists\n\
+         /// still apply, so out-of-policy tools are filtered independently\n\
+         /// at each hop."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "export async function {pipeline_fn_name}(\n  \
+         input: {input_ts},\n  \
+         options?: {{ tools?: Record<string, Tool>; abortSignal?: AbortSignal }},\n\
+         ): Promise<{output_ts}> {{"
+    )
+    .unwrap();
+
+    // Chain the steps. First step reads `input`; every subsequent step
+    // reads the previous step's output variable.
+    for (i, step) in steps.iter().enumerate() {
+        let step_fn = lower_first(&pascal_case(&step.name));
+        let input_var = if i == 0 {
+            "input".to_string()
+        } else {
+            format!("step{}Out", i)
+        };
+        let output_var = format!("step{}Out", i + 1);
+        writeln!(
+            out,
+            "  const {output_var} = await {step_fn}({input_var}, options);"
+        )
+        .unwrap();
+    }
+    writeln!(out, "  return step{}Out;", steps.len()).unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// `Foo` → `foo`. Minor helper used to derive step function names from
+/// their PascalCase type-alias identifiers.
+fn lower_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => {
+            let mut out = String::with_capacity(s.len());
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+            out.push_str(chars.as_str());
+            out
+        }
+        None => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,36 +566,28 @@ fn collect_referenced_names(ty: &TdType, out: &mut std::collections::HashSet<Str
     }
 }
 
-/// If the doc's `Prompt<I, O>` args aren't named types (bare object
-/// literals), emit them under synthesized `<Title>Input`/`Output`
-/// names. Named types are already handled by `write_local_schemas`.
-fn write_doc_io_aliases(
+/// If `ty` is a bare object / tuple / union (not a `NamedRef`),
+/// synthesize a `<synthesized_name>Schema` and matching
+/// `<synthesized_name>` TS type. Named types are already handled by
+/// `write_local_schemas`. Used for single-prompt I/O and per-pipeline-
+/// step I/O in the same shape.
+fn write_io_alias_if_needed(
     out: &mut String,
     env: &TypeEnv,
-    input: &TdType,
-    output: &TdType,
-    title: &str,
+    ty: &TdType,
+    synthesized_name: &str,
 ) -> Result<(), CodegenError> {
-    if !is_named_ref(input) {
-        let zod = emit_zod(input, env, "Input")?;
-        writeln!(out, "export const {title}InputSchema = {zod};").unwrap();
-        writeln!(
-            out,
-            "export type {title}Input = z.infer<typeof {title}InputSchema>;"
-        )
-        .unwrap();
-        writeln!(out).unwrap();
+    if is_named_ref(ty) {
+        return Ok(());
     }
-    if !is_named_ref(output) {
-        let zod = emit_zod(output, env, "Output")?;
-        writeln!(out, "export const {title}OutputSchema = {zod};").unwrap();
-        writeln!(
-            out,
-            "export type {title}Output = z.infer<typeof {title}OutputSchema>;"
-        )
-        .unwrap();
-        writeln!(out).unwrap();
-    }
+    let zod = emit_zod(ty, env, synthesized_name)?;
+    writeln!(out, "export const {synthesized_name}Schema = {zod};").unwrap();
+    writeln!(
+        out,
+        "export type {synthesized_name} = z.infer<typeof {synthesized_name}Schema>;"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
     Ok(())
 }
 
@@ -401,10 +657,9 @@ fn render_string_array(xs: &[String]) -> String {
 // System prompt
 // ---------------------------------------------------------------------------
 
-fn write_system_prompt(out: &mut String, unit: &CompileUnit<'_>, title: &str) {
-    let body = system_prompt(unit.file, unit.doc);
+fn write_system_prompt_const(out: &mut String, title: &str, body: &str) {
     writeln!(out, "/// Rendered system prompt (markdown body minus the `td` fences).").unwrap();
-    writeln!(out, "export const {title}System = {};", js_template_string(&body)).unwrap();
+    writeln!(out, "export const {title}System = {};", js_template_string(body)).unwrap();
 }
 
 /// Emit a multi-line JS string using a backtick template literal to
@@ -432,9 +687,9 @@ fn js_template_string(s: &str) -> String {
 
 fn write_invoke_function(
     out: &mut String,
-    unit: &CompileUnit<'_>,
     fn_name: &str,
     title: &str,
+    effects: &Effects,
     input: &TdType,
     output: &TdType,
 ) -> Result<(), CodegenError> {
@@ -446,7 +701,7 @@ fn write_invoke_function(
     let input_schema = schema_ref_for(input, &format!("{title}Input"));
     let output_schema = schema_ref_for(output, &format!("{title}Output"));
 
-    let has_uses = !unit.effects.uses.is_empty() || unit.effects.declared;
+    let has_uses = !effects.uses.is_empty() || effects.declared;
 
     writeln!(out, "/// Invoke the `{title}` prompt with structured I/O.").unwrap();
     writeln!(
@@ -487,7 +742,7 @@ fn write_invoke_function(
     if has_uses {
         writeln!(out, "    tools,").unwrap();
     }
-    if unit.effects.max_tokens.is_some() {
+    if effects.max_tokens.is_some() {
         writeln!(out, "    maxOutputTokens: {title}Policy.maxOutputTokens,").unwrap();
     }
     writeln!(out, "    abortSignal: options?.abortSignal,").unwrap();

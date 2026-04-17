@@ -199,35 +199,171 @@ r.
     );
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline codegen
+// ---------------------------------------------------------------------------
+
+const PIPELINE_SRC: &str = r#"---
+typedown: Pipeline
+---
+
+# Support pipeline
+
+```td
+import { Prompt, Uses, Reads, Model, MaxTokens } from "typedown/agents"
+import { Compose } from "typedown/workflows"
+
+type Query = { text: string }
+type Class = { kind: string }
+type Response = { answer: string }
+
+type Classify = Prompt<Query, Class> & Uses<[]> & Model<"m1"> & MaxTokens<512>
+type Answer   = Prompt<Class, Response> & Uses<["retrieve"]> & Reads<["./kb/**"]> & Model<"m2"> & MaxTokens<2048>
+
+export type Pipeline =
+  & Compose<[Classify, Answer]>
+  & Uses<["retrieve"]>
+  & Reads<["./kb/**"]>
+  & Model<"m1" | "m2">
+  & MaxTokens<4096>
+```
+
+## Overview
+
+Route queries through classify then answer.
+
+## Classify
+
+You are the classifier. Emit Class.
+
+## Answer
+
+Given Class, produce Response.
+"#;
+
 #[test]
-fn pipeline_doc_is_unsupported_in_v1() {
+fn pipeline_emits_steps_policy_and_orchestrator() {
+    let file = SourceFile::new("support_pipeline.md", PIPELINE_SRC.to_string());
+    let loaded = LoadedDoc::from_source(file).expect("pipeline loads");
+    let ts = ai_sdk::emit(&loaded.as_unit()).expect("pipeline compiles");
+
+    // Shared local schemas, topo-sorted, emitted before any step block.
+    assert!(ts.contains("export const QuerySchema"));
+    assert!(ts.contains("export const ClassSchema"));
+    assert!(ts.contains("export const ResponseSchema"));
+
+    // Per-step policy + system + function for each step.
+    assert!(ts.contains("export const ClassifyPolicy = {"));
+    assert!(ts.contains("export const ClassifySystem = `"));
+    assert!(ts.contains("export async function classify("));
+    assert!(ts.contains("export const AnswerPolicy = {"));
+    assert!(ts.contains("export const AnswerSystem = `"));
+    assert!(ts.contains("export async function answer("));
+
+    // Per-step system bodies are bucketed from the right heading.
+    let classify_sys_start = ts.find("export const ClassifySystem").unwrap();
+    let answer_sys_start = ts.find("export const AnswerSystem").unwrap();
+    let classify_body = &ts[classify_sys_start..answer_sys_start];
+    assert!(
+        classify_body.contains("You are the classifier"),
+        "classify system should contain classifier prose; got: {classify_body}"
+    );
+    assert!(
+        !classify_body.contains("Given Class, produce"),
+        "classify system must not include the answer heading body"
+    );
+
+    // Pipeline-level ceiling is emitted after the step blocks.
+    assert!(ts.contains("export const SupportPipelinePolicy = {"));
+
+    // Orchestrator chains classify → answer with typed I/O.
+    let orch = ts.find("export async function supportPipeline").unwrap();
+    let orch_body = &ts[orch..];
+    assert!(
+        orch_body.contains("input: Query,"),
+        "orchestrator input type must be the first step's input"
+    );
+    assert!(
+        orch_body.contains("): Promise<Response>"),
+        "orchestrator output type must be the last step's output"
+    );
+    assert!(
+        orch_body.contains("const step1Out = await classify(input, options);"),
+        "orchestrator must call classify first with `input`"
+    );
+    assert!(
+        orch_body.contains("const step2Out = await answer(step1Out, options);"),
+        "orchestrator must thread step1 output into step2"
+    );
+    assert!(
+        orch_body.contains("return step2Out;"),
+        "orchestrator must return the final step's output"
+    );
+}
+
+#[test]
+fn pipeline_step_without_heading_gets_warning_comment() {
+    // Step `Phantom` has no heading that contains its name — the
+    // emitter should emit a comment noting the gap and fall back to
+    // an empty system.
     let src = r#"---
 typedown: Pipeline
 ---
 
-# P
+# p
 
 ```td
-import { Prompt } from "typedown/agents"
+import { Prompt, Model } from "typedown/agents"
 import { Compose } from "typedown/workflows"
 
 type A = { a: string }
 type B = { b: string }
-type Step = Prompt<A, B>
 
-export type Pipeline = Compose<[Step]>
+type Phantom = Prompt<A, B> & Model<"m">
+
+export type Pipeline =
+  & Compose<[Phantom]>
+  & Model<"m">
+```
+
+## Unrelated heading
+
+No mention of the step's name.
+"#;
+    let file = SourceFile::new("phantom_pipeline.md", src.to_string());
+    let loaded = LoadedDoc::from_source(file).expect("loads");
+    let ts = ai_sdk::emit(&loaded.as_unit()).expect("compiles");
+    // Warning comment about the unmatched step.
+    assert!(
+        ts.contains("No `##` heading matched step `Phantom`"),
+        "expected warning comment; got: {ts}"
+    );
+    // Empty template string.
+    assert!(ts.contains("export const PhantomSystem = ``;"));
+}
+
+#[test]
+fn empty_pipeline_is_unsupported() {
+    // A Compose<[]> declaration is rejected at codegen time — there's
+    // no Prompt<I, O> to derive the orchestrator's I/O from. (The type
+    // checker doesn't currently forbid empty tuples; the codegen is
+    // the layer that cares.)
+    let src = r#"---
+typedown: Pipeline
+---
+
+# empty
+
+```td
+import { Compose } from "typedown/workflows"
+
+export type Pipeline = Compose<[]>
 ```
 "#;
-    let file = SourceFile::new("pipeline.md", src.to_string());
+    let file = SourceFile::new("empty.md", src.to_string());
     let loaded = LoadedDoc::from_source(file).expect("loads");
     let err = ai_sdk::emit(&loaded.as_unit()).unwrap_err();
-    match err {
-        CodegenError::UnsupportedShape { backend, shape, .. } => {
-            assert_eq!(backend, "ai-sdk");
-            assert!(shape.contains("pipeline"), "shape: {shape}");
-        }
-        other => panic!("expected UnsupportedShape, got {other}"),
-    }
+    assert!(matches!(err, CodegenError::UnsupportedShape { .. }));
 }
 
 #[test]

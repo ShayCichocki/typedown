@@ -13,6 +13,12 @@
 //! 3. Emit the remaining content, splicing out those ranges.
 //! 4. Trim trailing whitespace and collapse sequences of blank lines
 //!    introduced by the splicing.
+//!
+//! For pipeline documents, [`pipeline_step_prompts`] does a second
+//! pass that buckets the body by `##` heading and returns a per-step
+//! system prompt mapping.
+
+use std::collections::HashMap;
 
 use td_ast::md::{MdDoc, MdNodeKind};
 use td_core::SourceFile;
@@ -38,6 +44,112 @@ pub fn system_prompt(file: &SourceFile, doc: &MdDoc) -> String {
         out.push_str(&content[cursor..]);
     }
     normalize_whitespace(&out)
+}
+
+/// Bucket a pipeline document's markdown body into per-step system
+/// prompts.
+///
+/// For each step name (type-alias identifier like `Classify` /
+/// `Answer`), we find the first level-2 heading whose text contains
+/// the step name (case-insensitive substring) and take everything
+/// from that heading up to — but not including — the next level-2
+/// heading as that step's system prompt.
+///
+/// Step names are tried **longest-first** so that when both `A` and
+/// `AB` are step aliases, a heading `## AB` matches `AB` rather than
+/// `A`. Steps with no matching heading get an empty string; the
+/// caller emits a comment noting the unmatched step so the author
+/// can fix the doc.
+///
+/// `td` fence content and the frontmatter are stripped from every
+/// returned string so the per-step prompt is safe to splice into a
+/// TypeScript template literal without leaking type declarations.
+pub fn pipeline_step_prompts(
+    file: &SourceFile,
+    doc: &MdDoc,
+    step_names: &[String],
+) -> HashMap<String, String> {
+    let content = &file.content;
+    let body_start = frontmatter_end(content);
+    let td_spans = collect_td_spans(doc);
+
+    // Gather every level-2 heading with its byte start. We use the
+    // heading node's `span.start` as the range boundary so the
+    // rendered prompt *includes* the heading line — that gives the
+    // model context ("you are the step labeled X").
+    let headings: Vec<(usize, String)> = doc
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            MdNodeKind::Heading {
+                level: 2,
+                text,
+                ..
+            } => Some((n.span.start, text.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let mut out = HashMap::new();
+
+    // Sort step names by length descending so multi-word names win
+    // over prefixes of themselves.
+    let mut ordered = step_names.to_vec();
+    ordered.sort_by_key(|n| std::cmp::Reverse(n.len()));
+
+    // Track which heading indices have already been claimed so the
+    // same section isn't attributed to two steps.
+    let mut claimed = vec![false; headings.len()];
+
+    for step_name in &ordered {
+        let needle = step_name.to_ascii_lowercase();
+        let matched = headings.iter().enumerate().find(|(i, (_, text))| {
+            !claimed[*i] && text.to_ascii_lowercase().contains(&needle)
+        });
+        if let Some((idx, (start, _text))) = matched {
+            claimed[idx] = true;
+            // End of this step's range = start of next level-2 heading,
+            // or end of file.
+            let end = headings
+                .get(idx + 1)
+                .map(|(start, _)| *start)
+                .unwrap_or(content.len());
+            // Guard against the range preceding the body (shouldn't
+            // happen, but defensive).
+            let real_start = (*start).max(body_start);
+            let text = slice_without_td_fences(content, real_start, end, &td_spans);
+            out.insert(step_name.clone(), normalize_whitespace(&text));
+        } else {
+            out.insert(step_name.clone(), String::new());
+        }
+    }
+
+    out
+}
+
+/// Take `content[start..end]` with any `td` fence ranges spliced out.
+fn slice_without_td_fences(
+    content: &str,
+    start: usize,
+    end: usize,
+    td_spans: &[(usize, usize)],
+) -> String {
+    let mut out = String::with_capacity(end - start);
+    let mut cursor = start;
+    for (span_start, span_end) in td_spans {
+        if *span_end <= cursor || *span_start >= end {
+            continue;
+        }
+        let clamped_start = (*span_start).max(cursor);
+        if clamped_start > cursor {
+            out.push_str(&content[cursor..clamped_start]);
+        }
+        cursor = (*span_end).min(end);
+    }
+    if cursor < end {
+        out.push_str(&content[cursor..end]);
+    }
+    out
 }
 
 /// Return the byte offset immediately after the closing `---` of a
@@ -181,5 +293,107 @@ typedown: Doc
         let out = extract(src);
         // Never more than one blank line between sections after stripping.
         assert!(!out.contains("\n\n\n"), "got: {out:?}");
+    }
+
+    #[test]
+    fn pipeline_step_prompts_bucket_by_heading() {
+        let src = r#"---
+typedown: Pipeline
+---
+
+# Overview
+
+Pipeline docs have overview prose here.
+
+## Step 1 — Classify
+
+You are the classifier. Emit JSON matching Classification.
+
+## Step 2 — Answer
+
+Given the classification, produce an answer.
+"#;
+        let file = SourceFile::new("p.md", src.to_string());
+        let (doc, _) = parse_markdown(&file.content);
+        let prompts = pipeline_step_prompts(
+            &file,
+            &doc,
+            &["Classify".to_string(), "Answer".to_string()],
+        );
+        assert!(prompts["Classify"].contains("You are the classifier"));
+        assert!(!prompts["Classify"].contains("Given the classification"));
+        assert!(prompts["Answer"].contains("Given the classification"));
+        assert!(!prompts["Answer"].contains("You are the classifier"));
+    }
+
+    #[test]
+    fn pipeline_step_prompts_longest_name_wins() {
+        // Step name "Review" and "ReviewOutput" — a heading `## ReviewOutput`
+        // should match ReviewOutput, not Review.
+        let src = r#"---
+typedown: Pipeline
+---
+
+## Review
+
+Short-named step prose.
+
+## ReviewOutput
+
+Longer-named step prose.
+"#;
+        let file = SourceFile::new("p.md", src.to_string());
+        let (doc, _) = parse_markdown(&file.content);
+        let prompts = pipeline_step_prompts(
+            &file,
+            &doc,
+            &["Review".to_string(), "ReviewOutput".to_string()],
+        );
+        assert!(prompts["Review"].contains("Short-named"));
+        assert!(prompts["ReviewOutput"].contains("Longer-named"));
+        assert!(!prompts["ReviewOutput"].contains("Short-named"));
+    }
+
+    #[test]
+    fn pipeline_step_without_heading_gets_empty_prompt() {
+        let src = r#"---
+typedown: Pipeline
+---
+
+## Step 1 — Classify
+
+Classifier only.
+"#;
+        let file = SourceFile::new("p.md", src.to_string());
+        let (doc, _) = parse_markdown(&file.content);
+        let prompts = pipeline_step_prompts(
+            &file,
+            &doc,
+            &["Classify".to_string(), "Answer".to_string()],
+        );
+        assert!(!prompts["Classify"].is_empty());
+        assert_eq!(prompts["Answer"], "");
+    }
+
+    #[test]
+    fn pipeline_step_prompts_strip_td_fences_in_bucket() {
+        let src = r#"---
+typedown: Pipeline
+---
+
+## Classify
+
+```td
+type X = string
+```
+
+You are the classifier.
+"#;
+        let file = SourceFile::new("p.md", src.to_string());
+        let (doc, _) = parse_markdown(&file.content);
+        let prompts =
+            pipeline_step_prompts(&file, &doc, &["Classify".to_string()]);
+        assert!(prompts["Classify"].contains("You are the classifier"));
+        assert!(!prompts["Classify"].contains("type X"), "got: {:?}", prompts["Classify"]);
     }
 }
