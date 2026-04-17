@@ -53,6 +53,10 @@ Run `typedown check docs/` and the checker verifies:
 - each example has `Input:` and `Output:` markers
 - no undeclared `##` sections slip in
 
+## Example
+
+![typedown CLI output](docs/typedown.png)
+
 ## Layout
 
 ```
