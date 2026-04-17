@@ -1,0 +1,21 @@
+[package]
+name = "td-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "typedown"
+path = "src/main.rs"
+
+[dependencies]
+td-core = { workspace = true }
+td-ast = { workspace = true }
+td-parse = { workspace = true }
+td-check = { workspace = true }
+td-stdlib = { workspace = true }
+clap = { workspace = true }
+miette = { workspace = true }
+ignore = { workspace = true }

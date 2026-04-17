@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/td-core",
+    "crates/td-ast",
+    "crates/td-parse",
+    "crates/td-check",
+    "crates/td-stdlib",
+    "crates/td-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/anomalyco/typedown"
+authors = ["typedown contributors"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+# internal
+td-core = { path = "crates/td-core" }
+td-ast = { path = "crates/td-ast" }
+td-parse = { path = "crates/td-parse" }
+td-check = { path = "crates/td-check" }
+td-stdlib = { path = "crates/td-stdlib" }
+
+# parsing
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# diagnostics & DX
+miette = { version = "7", features = ["fancy"] }
+thiserror = "1"
+
+# cli
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+
+# test
+insta = { version = "1", features = ["yaml"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

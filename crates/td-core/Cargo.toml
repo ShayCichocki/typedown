@@ -1,0 +1,12 @@
+[package]
+name = "td-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+miette = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "td-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+td-core = { workspace = true }
+td-ast = { workspace = true }
+pulldown-cmark = { workspace = true }

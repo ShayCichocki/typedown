@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Lockfile policy: typedown is a workspace of libraries + a binary. We keep
+# Cargo.lock checked in (standard for binaries). Remove the next line if you
+# later want library-only semantics.
+# Cargo.lock
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.*.sw[a-p]
+.netrwhist
+.helix/
+.zed/
+
+# ---------------------------------------------------------------------------
+# macOS / Linux / Windows cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---------------------------------------------------------------------------
+# Build artifacts / caches
+# ---------------------------------------------------------------------------
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.log
+*.tmp
+.cache/
+coverage/
+*.profraw
+*.profdata
+
+# insta snapshot review artifacts
+**/*.snap.new
+**/.pending-snap
+
+# flamegraph / perf
+perf.data
+perf.data.old
+flamegraph.svg
+
+# ---------------------------------------------------------------------------
+# Node / JS (future LSP demo, docs site, etc.)
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.next/
+.turbo/
+.vercel/
+dist/
+build/
+
+# ---------------------------------------------------------------------------
+# Python (possible tooling glue)
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---------------------------------------------------------------------------
+# Env / secrets
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# typedown-local
+# ---------------------------------------------------------------------------
+# scratch checks people run locally
+/scratch/
+/.typedown-cache/
