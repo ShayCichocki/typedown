@@ -7,6 +7,7 @@ members = [
     "crates/td-check",
     "crates/td-stdlib",
     "crates/td-cli",
+    "crates/td-runtime",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ td-ast = { path = "crates/td-ast" }
 td-parse = { path = "crates/td-parse" }
 td-check = { path = "crates/td-check" }
 td-stdlib = { path = "crates/td-stdlib" }
+td-runtime = { path = "crates/td-runtime" }
 
 # parsing
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
@@ -38,6 +40,9 @@ thiserror = "1"
 # cli
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
+
+# runtime
+globset = "0.4"
 
 # test
 insta = { version = "1", features = ["yaml"] }

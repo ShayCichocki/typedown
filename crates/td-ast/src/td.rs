@@ -65,6 +65,9 @@ pub enum TdType {
     NumberLit { span: Span, value: f64 },
     /// `string[]` sugar == `Array<string>`.
     Array { span: Span, elem: Box<TdType> },
+    /// `[T1, T2, ...]` — positional tuple. Zero-width (`[]`) is legal and
+    /// encodes the empty-tuple type, used by effect rows like `Writes<[]>`.
+    Tuple { span: Span, elems: Vec<TdType> },
     /// `{ foo: string; bar?: number }`.
     Object(TdObjectType),
     /// `A | B | C`.
@@ -115,6 +118,7 @@ impl TdType {
             | TdType::StringLit { span, .. }
             | TdType::NumberLit { span, .. }
             | TdType::Array { span, .. }
+            | TdType::Tuple { span, .. }
             | TdType::Union { span, .. }
             | TdType::Intersection { span, .. }
             | TdType::NamedRef { span, .. } => *span,

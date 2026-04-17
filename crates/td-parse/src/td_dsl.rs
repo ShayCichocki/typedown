@@ -13,12 +13,18 @@
 //! intersection:= postfix ('&' postfix)*
 //! postfix     := atom ('[' ']')*
 //! atom        := primitive | string_lit | number_lit | named_ref | object
-//!              | '(' type ')'
+//!              | tuple | '(' type ')'
 //! primitive   := 'string' | 'number' | 'boolean' | 'null' | 'any'
 //! named_ref   := ident ('<' type (',' type)* '>')?
 //! object      := '{' (field (';'|',')?)* '}'
+//! tuple       := '[' (type (',' type)*)? ']'
 //! field       := (doc_comment)? ident '?'? ':' type
 //! ```
+//!
+//! Disambiguation: `[` as a postfix after an atom is the array marker
+//! (`string[]`), but `[` in atom position starts a tuple literal. The
+//! two don't collide because `parse_postfix` only consumes `[` after
+//! a complete atom.
 //!
 //! Deliberately tiny. We get: unions, intersections, generics, arrays, object
 //! types, and imports. Everything the checker needs for `Prompt<I, O> & {...}`
@@ -461,6 +467,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_union(&mut self) -> TdType {
+        // Accept TS-style leading `|` for pretty-formatted union lists:
+        //   type T =
+        //     | "a"
+        //     | "b"
+        // Equivalent to the single-line form with no leading operator.
+        self.eat_punct('|');
         let first = self.parse_intersection();
         if !matches!(self.peek_kind(), Tok::Punct('|')) {
             return first;
@@ -478,6 +490,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_intersection(&mut self) -> TdType {
+        // Accept TS-style leading `&` for pretty-formatted intersections:
+        //   type Doc =
+        //     & Prompt<In, Out>
+        //     & Uses<["read_file"]>
+        // Effect-row documents are almost always written this way.
+        self.eat_punct('&');
         let first = self.parse_postfix();
         if !matches!(self.peek_kind(), Tok::Punct('&')) {
             return first;
@@ -518,6 +536,7 @@ impl<'a> Parser<'a> {
                 span,
                 fields: vec![],
             })),
+            Tok::Punct('[') => self.parse_tuple(),
             Tok::Punct('(') => {
                 self.bump();
                 let inner = self.parse_type();
@@ -595,6 +614,47 @@ impl<'a> Parser<'a> {
                     kind: TdPrim::Any,
                 }
             }
+        }
+    }
+
+    /// Parse a tuple literal type `[T1, T2, ...]`. The empty tuple `[]` is
+    /// legal and semantically meaningful (used by effect rows like
+    /// `Writes<[]>` to declare "no writes permitted").
+    fn parse_tuple(&mut self) -> TdType {
+        let start = self.bump().span; // consume '['
+        let mut elems = Vec::new();
+        let end;
+        loop {
+            if let Some(sp) = self.match_punct(']') {
+                end = sp;
+                break;
+            }
+            let ty = self.parse_type();
+            let last = ty.span();
+            elems.push(ty);
+            if self.eat_punct(',') {
+                continue;
+            }
+            if let Some(sp) = self.match_punct(']') {
+                end = sp;
+                break;
+            }
+            // Neither `,` nor `]`: emit the missing-delimiter error and stop.
+            self.expect_punct(']');
+            end = last;
+            break;
+        }
+        TdType::Tuple {
+            span: start.join(end),
+            elems,
+        }
+    }
+
+    fn match_punct(&mut self, p: char) -> Option<Span> {
+        if matches!(self.peek_kind(), Tok::Punct(c) if *c == p) {
+            Some(self.bump().span)
+        } else {
+            None
         }
     }
 
@@ -700,5 +760,56 @@ mod tests {
             TdDeclKind::Interface(o) => assert_eq!(o.fields.len(), 2),
             other => panic!("wrong kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_empty_tuple() {
+        let (m, d) = parse("type T = []");
+        assert!(d.is_empty(), "diags: {:#?}", d.into_vec());
+        match &m.decls[0].kind {
+            TdDeclKind::TypeAlias(TdType::Tuple { elems, .. }) => {
+                assert!(elems.is_empty());
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_string_literal_tuple() {
+        let (m, d) = parse(r#"type T = ["read", "write"]"#);
+        assert!(d.is_empty(), "diags: {:#?}", d.into_vec());
+        match &m.decls[0].kind {
+            TdDeclKind::TypeAlias(TdType::Tuple { elems, .. }) => {
+                assert_eq!(elems.len(), 2);
+                assert!(matches!(
+                    &elems[0],
+                    TdType::StringLit { value, .. } if value == "read"
+                ));
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tuple_as_type_arg() {
+        let (m, d) = parse(r#"type T = Uses<["a", "b"]>"#);
+        assert!(d.is_empty(), "diags: {:#?}", d.into_vec());
+        match &m.decls[0].kind {
+            TdDeclKind::TypeAlias(TdType::NamedRef { name, type_args, .. }) => {
+                assert_eq!(name, "Uses");
+                assert_eq!(type_args.len(), 1);
+                assert!(matches!(&type_args[0], TdType::Tuple { elems, .. } if elems.len() == 2));
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_and_tuple_dont_collide() {
+        // `string[]` is still array-of-string; `[string]` is 1-tuple.
+        let (m, d) = parse("type A = string[]\ntype B = [string]");
+        assert!(d.is_empty(), "diags: {:#?}", d.into_vec());
+        assert!(matches!(m.decls[0].kind, TdDeclKind::TypeAlias(TdType::Array { .. })));
+        assert!(matches!(m.decls[1].kind, TdDeclKind::TypeAlias(TdType::Tuple { .. })));
     }
 }

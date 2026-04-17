@@ -604,6 +604,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-runtime"
+version = "0.0.1"
+dependencies = [
+ "globset",
+ "serde",
+ "serde_json",
+ "td-ast",
+ "td-check",
+ "td-core",
+ "td-parse",
+ "td-stdlib",
+ "thiserror",
+]
+
+[[package]]
 name = "td-stdlib"
 version = "0.0.1"
 dependencies = [

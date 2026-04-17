@@ -376,10 +376,13 @@ fn check_body_against(
             }
         }
 
-        // Primitives at the body level aren't meaningful (they describe
-        // values, not markdown bodies). Quietly accept — they're typically
-        // used inside Example<I, O> code-fence values.
-        TdType::Primitive { .. } | TdType::StringLit { .. } | TdType::NumberLit { .. } => {}
+        // Primitives & tuples at the body level aren't meaningful — they
+        // describe *values*, not markdown bodies. Quietly accept; they get
+        // meaningful checks inside `Example<I, O>` value fences instead.
+        TdType::Primitive { .. }
+        | TdType::StringLit { .. }
+        | TdType::NumberLit { .. }
+        | TdType::Tuple { .. } => {}
     }
 }
 

@@ -25,20 +25,29 @@ use serde_json::{json, Map, Value};
 use td_ast::td::{TdObjectType, TdPrim, TdType};
 use td_stdlib::Builtin;
 
+use crate::effects::Effects;
 use crate::env::{EntryOrigin, LookupResult, TypeEnv};
 
 /// Render a type as a standalone JSON Schema document.
 ///
-/// The returned `Value` includes `$schema` and — if available — a `title`
-/// from the caller. Every user-declared (non-stdlib) type from the env is
-/// emitted under `$defs` so downstream consumers can reference them
-/// individually — this is where the real schema value lives for most
-/// docs, since top-level `Prompt<I, O>` types describe markdown shape
-/// rather than values.
+/// The returned `Value` includes `$schema`, optional `title`, `$defs` for
+/// every user-declared type, and — when non-empty — an `x-typedown-effects`
+/// vendor extension carrying the prompt's declared policy (tools, reads,
+/// writes, model, token ceiling).
 ///
-/// Use [`to_subschema`] when embedding inside a larger schema, since only
-/// the root should carry `$schema`, `title`, and `$defs`.
-pub fn to_json_schema(ty: &TdType, env: &TypeEnv, title: Option<&str>) -> Value {
+/// Vendor extensions are legal JSON Schema (`x-*` is reserved for them);
+/// consumers that don't understand them preserve them untouched. That's
+/// exactly what we want — effects flow through bundlers, validators, and
+/// provider-spec generators without losing fidelity.
+///
+/// Use [`to_subschema`] when embedding inside a larger schema; only the
+/// root should carry `$schema`, `title`, `$defs`, and `x-typedown-effects`.
+pub fn to_json_schema(
+    ty: &TdType,
+    env: &TypeEnv,
+    title: Option<&str>,
+    effects: Option<&Effects>,
+) -> Value {
     let mut schema = to_subschema(ty, env);
 
     // Only the root object-schema is allowed to grow metadata keys. For
@@ -60,22 +69,57 @@ pub fn to_json_schema(ty: &TdType, env: &TypeEnv, title: Option<&str>) -> Value 
         if !defs.is_empty() {
             map.insert("$defs".into(), Value::Object(defs));
         }
+        if let Some(fx) = effects {
+            if fx.declared {
+                map.insert("x-typedown-effects".into(), effects_schema(fx));
+            }
+        }
     }
     schema
+}
+
+/// Serialize an [`Effects`] record to the JSON Schema vendor-extension form.
+///
+/// The key names mirror the stdlib markers (`uses`, `reads`, `writes`,
+/// `model`, `maxTokens`) for easy runtime decoding. Empty collections are
+/// emitted explicitly — `"writes": []` carries meaning (deny-all writes)
+/// distinct from the absence of the field.
+fn effects_schema(fx: &Effects) -> Value {
+    let mut map = Map::new();
+    map.insert("uses".into(), json!(fx.uses));
+    map.insert("reads".into(), json!(fx.reads));
+    map.insert("writes".into(), json!(fx.writes));
+    if !fx.models.is_empty() {
+        map.insert("model".into(), json!(fx.models));
+    }
+    if let Some(n) = fx.max_tokens {
+        map.insert("maxTokens".into(), json!(n));
+    }
+    Value::Object(map)
 }
 
 /// Compile every locally-declared (non-stdlib) type in the env into a
 /// `$defs` map. Stdlib types like `Prompt`, `Section`, `Readme` are excluded
 /// because emitting them inline would bloat the output without value —
 /// they already expand fully wherever they're referenced.
+///
+/// Effect rows inside each declaration are stripped before emission so
+/// value-shaped consumers of the schema (validators, codegen) see only
+/// the content shape. The policy still lives at the root under
+/// `x-typedown-effects` where it belongs.
 fn local_defs(env: &TypeEnv) -> Map<String, Value> {
+    // Use a fake SourceFile so effect-stripping can accept diagnostics;
+    // they're discarded because any malformed effect will have already
+    // been reported upstream by `resolve_doc_type`.
+    let throwaway = td_core::SourceFile::new("__defs__", String::new());
     let mut defs = Map::new();
     for (name, entry) in &env.entries {
         if !matches!(entry.origin, EntryOrigin::Local) {
             continue;
         }
         let body = env.instantiate(&entry.decl, &[]);
-        defs.insert(name.clone(), to_subschema(&body, env));
+        let (stripped, _fx, _diags) = crate::effects::split_effects(&body, env, &throwaway);
+        defs.insert(name.clone(), to_subschema(&stripped, env));
     }
     defs
 }
@@ -99,6 +143,26 @@ pub fn to_subschema(ty: &TdType, env: &TypeEnv) -> Value {
             "type": "array",
             "items": to_subschema(elem, env),
         }),
+
+        // Tuple → Draft 2020-12 "prefixItems" with `items: false` to forbid
+        // extra positional elements. The empty tuple renders as "array of
+        // length exactly 0," i.e. `maxItems: 0` — useful for `Writes<[]>`.
+        TdType::Tuple { elems, .. } => {
+            if elems.is_empty() {
+                json!({
+                    "type": "array",
+                    "maxItems": 0,
+                })
+            } else {
+                json!({
+                    "type": "array",
+                    "prefixItems": elems.iter().map(|e| to_subschema(e, env)).collect::<Vec<_>>(),
+                    "items": false,
+                    "minItems": elems.len(),
+                    "maxItems": elems.len(),
+                })
+            }
+        }
 
         TdType::Object(obj) => object_schema(obj, env),
 
@@ -321,11 +385,35 @@ mod tests {
     #[test]
     fn root_schema_has_metadata() {
         let env = env_from("type T = { x: string }");
-        let s = to_json_schema(&type_of(&env, "T"), &env, Some("Doc"));
+        let s = to_json_schema(&type_of(&env, "T"), &env, Some("Doc"), None);
         assert_eq!(s["title"], json!("Doc"));
         assert_eq!(
             s["$schema"],
             json!("https://json-schema.org/draft/2020-12/schema")
         );
+        assert!(
+            !s.get("x-typedown-effects").is_some(),
+            "no effects should not emit the vendor extension"
+        );
+    }
+
+    #[test]
+    fn effects_render_as_vendor_extension() {
+        let env = env_from("type T = { x: string }");
+        let fx = Effects {
+            uses: vec!["read_file".into(), "run_tests".into()],
+            reads: vec!["./src/**".into()],
+            writes: vec![],
+            models: vec!["claude-opus-4-5".into()],
+            max_tokens: Some(4096),
+            declared: true,
+        };
+        let s = to_json_schema(&type_of(&env, "T"), &env, Some("Doc"), Some(&fx));
+        let x = &s["x-typedown-effects"];
+        assert_eq!(x["uses"], json!(["read_file", "run_tests"]));
+        assert_eq!(x["reads"], json!(["./src/**"]));
+        assert_eq!(x["writes"], json!([]));
+        assert_eq!(x["model"], json!(["claude-opus-4-5"]));
+        assert_eq!(x["maxTokens"], json!(4096));
     }
 }

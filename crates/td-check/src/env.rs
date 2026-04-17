@@ -31,6 +31,7 @@ pub enum EntryOrigin {
     Stdlib(&'static str),
 }
 
+#[derive(Debug)]
 pub struct TypeEnv {
     pub entries: HashMap<String, EnvEntry>,
 }
@@ -182,6 +183,10 @@ fn substitute(ty: &TdType, map: &HashMap<&str, &TdType>) -> TdType {
         TdType::Array { span, elem } => TdType::Array {
             span: *span,
             elem: Box::new(substitute(elem, map)),
+        },
+        TdType::Tuple { span, elems } => TdType::Tuple {
+            span: *span,
+            elems: elems.iter().map(|e| substitute(e, map)).collect(),
         },
         TdType::Object(o) => {
             let fields = o

@@ -1,5 +1,5 @@
 ---
-typedown: Prompt<ReviewInput, ReviewOutput>
+typedown: Doc
 ---
 
 # Code Reviewer
@@ -8,7 +8,14 @@ A typed prompt for an LLM code-review agent. The checker enforces the
 sections below against the declared `Prompt<I, O>` shape.
 
 ```td
-import { Prompt, Section, Prose, OrderedList, Example } from "typedown/agents"
+import {
+  Prompt,
+  Uses,
+  Reads,
+  Writes,
+  Model,
+  MaxTokens,
+} from "typedown/agents"
 
 export type ReviewInput = {
   diff: string
@@ -27,7 +34,17 @@ export interface Comment {
   body: string
 }
 
-export type Doc = Prompt<ReviewInput, ReviewOutput>
+// The document's declared type is both a content shape AND a policy:
+// which tools this prompt may invoke, which paths it may read/write,
+// which models it's validated against, and its token ceiling. The
+// `td-runtime` crate refuses to run anything not declared here.
+export type Doc =
+  & Prompt<ReviewInput, ReviewOutput>
+  & Uses<["read_file", "run_tests"]>
+  & Reads<["./src/**", "./tests/**"]>
+  & Writes<[]>
+  & Model<"claude-opus-4-5" | "claude-sonnet-4-5">
+  & MaxTokens<4096>
 ```
 
 ## Role

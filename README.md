@@ -1,25 +1,32 @@
 # typedown
 
-**Statically typed markdown.** A lint + type checker for markdown files aimed
-at agent-facing documents (prompts, tool specs, runbooks, AGENTS.md).
+**Statically typed markdown.** A lint + type checker + contract runtime
+for markdown files aimed at agent-facing documents (prompts, tool specs,
+runbooks, AGENTS.md).
 
 Markdown is load-bearing infrastructure for LLMs now, but it's `any`-typed.
-typedown gives it types.
+typedown gives it types — and now, through **effect rows**, a capability
+contract that a runtime can enforce.
 
 ## Concept
 
 Declare a document's type in frontmatter and author types inline with a
-TypeScript-flavored DSL in ``` ```td ``` fences:
+TypeScript-flavored DSL in ``` ```td ``` fences. The document's type is
+both a **content shape** (what sections and values belong) and a **policy**
+(what tools it may invoke, what paths it may read/write, which models it
+was validated against):
 
 `````md
 ---
-typedown: Prompt<ReviewInput, ReviewOutput>
+typedown: Doc
 ---
 
 # Code Reviewer
 
 ```td
-import { Prompt } from "typedown/agents"
+import {
+  Prompt, Uses, Reads, Writes, Model, MaxTokens,
+} from "typedown/agents"
 
 type ReviewInput  = { diff: string, context: string }
 type ReviewOutput = { approved: boolean, comments: Comment[] }
@@ -31,7 +38,13 @@ interface Comment {
   body: string
 }
 
-export type Doc = Prompt<ReviewInput, ReviewOutput>
+export type Doc =
+  & Prompt<ReviewInput, ReviewOutput>
+  & Uses<["read_file", "run_tests"]>
+  & Reads<["./src/**", "./tests/**"]>
+  & Writes<[]>
+  & Model<"claude-opus-4-5" | "claude-sonnet-4-5">
+  & MaxTokens<4096>
 ```
 
 ## Role
@@ -70,6 +83,9 @@ Run `typedown check docs/` and the checker verifies:
   against the declared `I` / `O`** — wrong primitives, missing required
   fields, enum violations, malformed JSON all get pinpointed diagnostics
 - no undeclared `##` sections slip in
+- every effect row (`Uses`, `Reads`, `Writes`, `Model`, `MaxTokens`) is
+  well-formed — tuple args of the right shape, number literals for
+  ceilings, and so on
 
 ## Example
 
@@ -79,12 +95,15 @@ Run `typedown check docs/` and the checker verifies:
 
 ```
 crates/
-  td-core/    diagnostics + spans
-  td-ast/     markdown & td-DSL ASTs
-  td-parse/   markdown parser + td-DSL parser
-  td-check/   type env, conformance rules, value typing, JSON Schema export
-  td-stdlib/  built-in types (Section, Prose, Prompt, Tool, Runbook, …)
-  td-cli/     `typedown` binary: check / types / export subcommands
+  td-core/     diagnostics + spans
+  td-ast/      markdown & td-DSL ASTs
+  td-parse/    markdown parser + td-DSL parser
+  td-check/    type env, conformance, value typing, effect rows, JSON Schema
+  td-stdlib/   built-in types (Section, Prose, Prompt, Tool, Runbook,
+               Uses, Reads, Writes, Model, MaxTokens, …)
+  td-runtime/  EnforcedPrompt: refuse unauthorized tool calls / reads / writes
+               at runtime from a typed-markdown contract
+  td-cli/      `typedown` binary: check / types / export / effects
 ```
 
 ## Usage
@@ -94,6 +113,8 @@ cargo run -p td-cli -- check examples/
 cargo run -p td-cli -- types                         # print stdlib modules
 cargo run -p td-cli -- export examples/foo.md        # JSON Schema → stdout
 cargo run -p td-cli -- export examples/foo.md -o out.json
+cargo run -p td-cli -- effects examples/foo.md       # print the policy
+cargo run -p td-cli -- effects examples/foo.md --json
 ```
 
 ## Typed example values
@@ -125,6 +146,72 @@ comments:
 Prose-only examples (no value fences) continue to work — value typing is
 strictly opt-in.
 
+## Effect rows — prompts as contracts
+
+A typed prompt's declared type can carry a **capability policy** alongside
+its content shape. Five markers ship in `typedown/agents`:
+
+| marker           | meaning                                                     |
+|------------------|-------------------------------------------------------------|
+| `Uses<T>`        | tuple of tool names this prompt may invoke                  |
+| `Reads<T>`       | tuple of glob patterns this prompt may read                 |
+| `Writes<T>`      | tuple of glob patterns this prompt may write                |
+| `Model<T>`       | tuple or string-union of model identifiers it was validated against |
+| `MaxTokens<N>`   | number literal: hard ceiling the runtime enforces           |
+
+You opt in by intersecting them into the document's declared type:
+
+```ts
+export type Doc =
+  & Prompt<In, Out>
+  & Uses<["read_file", "run_tests"]>
+  & Reads<["./src/**", "./tests/**"]>
+  & Writes<[]>                                  // explicit: cannot write
+  & Model<"claude-opus-4-5" | "claude-sonnet-4-5">
+  & MaxTokens<4096>
+```
+
+Effects flow all the way through the toolchain:
+
+- `typedown check` validates effect-row arguments (tuples of string
+  literals, numbers for `MaxTokens`, etc.) — malformed rows fire **td601**.
+- `typedown export` emits them as the `x-typedown-effects` vendor
+  extension on the root JSON Schema, so downstream consumers (OpenAPI,
+  provider tool-call specs, etc.) preserve the policy.
+- `typedown effects <file>` prints the declared policy table — useful for
+  quick audits.
+- `td-runtime`'s `EnforcedPrompt` refuses unauthorized tool calls,
+  reads, writes, models, and over-budget token requests, and validates
+  concrete JSON input/output against `I` and `O`.
+
+### Runtime enforcement (`td-runtime`)
+
+```rust
+use td_runtime::EnforcedPrompt;
+
+let prompt = EnforcedPrompt::load("prompts/reviewer.md")?;
+
+// Before letting the model invoke a tool, ask the contract.
+prompt.authorize_tool("read_file")?;                    // Ok
+prompt.authorize_tool("shell_exec").unwrap_err();       // deny
+
+// Path policy is compiled to a GlobSet at load time.
+prompt.authorize_read("./src/auth/user.ts")?;           // Ok
+prompt.authorize_write("./src/auth/user.ts").unwrap_err(); // Writes<[]>
+
+// Input / output validation uses the same judgement as `typedown check`.
+prompt.validate_input(&serde_json::json!({
+    "diff": "...", "context": "src/auth.ts",
+}))?;
+
+prompt.check_token_limit(4096)?;                        // Ok
+prompt.check_token_limit(4097).unwrap_err();            // over ceiling
+```
+
+`EnforcedPrompt::load` **refuses to construct** if the doc wouldn't pass
+`typedown check`. Silently enforcing an empty policy on a broken contract
+is a security anti-pattern.
+
 ## Diagnostic codes
 
 | code   | severity | meaning                                          |
@@ -143,12 +230,15 @@ strictly opt-in.
 | td501  | error    | value fence failed to parse (JSON / YAML syntax) |
 | td502  | error    | value does not match declared type               |
 | td504  | warning  | value has extra field not declared in the type   |
+| td601  | error    | malformed effect row (bad argument shape)        |
 
 ## Stdlib
 
 Two modules ship out of the box:
 
-- **`typedown/agents`** — `Prompt<I, O>`, `Tool<A, R>`, `Runbook`, `Example<I, O>`
+- **`typedown/agents`** —
+  - Content types: `Prompt<I, O>`, `Tool<A, R>`, `Runbook`, `Example<I, O>`
+  - Effect rows: `Uses<T>`, `Reads<T>`, `Writes<T>`, `Model<T>`, `MaxTokens<N>`
 - **`typedown/docs`** — `Readme`, `AgentsMd`
 
 Plus implicit content-shape primitives usable without import:
@@ -158,20 +248,27 @@ Plus implicit content-shape primitives usable without import:
 ## Status
 
 Shipping today:
-- Markdown + td-DSL parsing
+- Markdown + td-DSL parsing (intersections, unions, tuples, generics,
+  TS-style leading `&` / `|` operators)
 - Generic instantiation & intersection flattening
 - Full conformance check for `Prompt<I, O>` and `Readme` / `AgentsMd`
 - **Value typing**: JSON / YAML fences inside `Example<I, O>` are parsed
   and checked against `I` / `O` — generic parameters are no longer phantom
 - **Schema export**: `typedown export` emits JSON Schema (Draft 2020-12)
-  with every local type declaration under `$defs`
-- CLI with miette diagnostics
+  with every local type declaration under `$defs` and effect rows under
+  `x-typedown-effects`
+- **Effect rows**: `Uses<>`, `Reads<>`, `Writes<>`, `Model<>`,
+  `MaxTokens<>` intersected into the doc's type declare a capability
+  policy surface
+- **`td-runtime`**: `EnforcedPrompt::load` refuses unauthorized tool
+  calls, reads, writes, models, and over-budget token requests;
+  validates concrete JSON I/O against `I` and `O`
+- CLI with miette diagnostics: `check` / `types` / `export` / `effects`
 
 Roadmap:
-- Effect / capability types (`Uses<>`, `Reads<>`, `Writes<>`) for agent
-  prompt policy
 - `td diff` for semver-style compatibility checks between doc versions
 - Additional export targets (`.d.ts`, Zod, OpenAI / Anthropic tool JSON)
+- Reference Anthropic / OpenAI client wrappers that consume `EnforcedPrompt`
 - LSP server (`td-lsp`) for in-editor diagnostics
 - User-authored `.td` modules via import paths
 - Executable code-fence checking (tsc / rustc / shellcheck on blocks)

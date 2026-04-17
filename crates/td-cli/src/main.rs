@@ -50,6 +50,19 @@ enum Cmd {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+    /// Print the effect-row policy declared on a typed document.
+    ///
+    /// Shows the tools, reads, writes, allowed models, and token ceiling
+    /// — the same data td-runtime uses to enforce behavior. Useful for
+    /// policy audits and shell-based pipelines that want to pre-check
+    /// capability sets before wiring up the runtime.
+    Effects {
+        /// Markdown file to inspect.
+        path: PathBuf,
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -64,6 +77,7 @@ fn main() -> ExitCode {
         Cmd::Check { paths } => run_check(paths),
         Cmd::Types => run_types(),
         Cmd::Export { path, format, out } => run_export(path, format, out),
+        Cmd::Effects { path, json } => run_effects(path, json),
     }
 }
 
@@ -123,7 +137,7 @@ fn run_export(path: PathBuf, format: ExportFormat, out: Option<PathBuf>) -> Exit
         }
     };
     let file = SourceFile::new(&path, content);
-    let (_doc, env, ty, diagnostics) = resolve_doc_type(&file);
+    let (_doc, env, ty, effects, diagnostics) = resolve_doc_type(&file);
 
     // Hard-fail on diagnostics originating from the type machinery itself
     // (unknown imports, syntax errors in td fences). Rendering the schema
@@ -151,7 +165,7 @@ fn run_export(path: PathBuf, format: ExportFormat, out: Option<PathBuf>) -> Exit
     let rendered = match format {
         ExportFormat::JsonSchema => {
             let title = path.file_stem().and_then(|s| s.to_str()).map(str::to_string);
-            let schema = to_json_schema(&ty, &env, title.as_deref());
+            let schema = to_json_schema(&ty, &env, title.as_deref(), Some(&effects));
             match serde_json::to_string_pretty(&schema) {
                 Ok(s) => s,
                 Err(e) => {
@@ -172,6 +186,64 @@ fn run_export(path: PathBuf, format: ExportFormat, out: Option<PathBuf>) -> Exit
         None => println!("{rendered}"),
     }
     ExitCode::SUCCESS
+}
+
+fn run_effects(path: PathBuf, json: bool) -> ExitCode {
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to read {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let file = SourceFile::new(&path, content);
+    let (_doc, _env, _ty, effects, _diags) = resolve_doc_type(&file);
+
+    if json {
+        let obj = serde_json::json!({
+            "declared": effects.declared,
+            "uses": effects.uses,
+            "reads": effects.reads,
+            "writes": effects.writes,
+            "model": effects.models,
+            "maxTokens": effects.max_tokens,
+        });
+        match serde_json::to_string_pretty(&obj) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("failed to render: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if !effects.declared {
+        println!("{}: no effect rows declared", path.display());
+        return ExitCode::SUCCESS;
+    }
+
+    println!("{}", path.display());
+    println!("  uses:       {}", fmt_list(&effects.uses));
+    println!("  reads:      {}", fmt_list(&effects.reads));
+    println!("  writes:     {}", fmt_list(&effects.writes));
+    println!("  model:      {}", fmt_list(&effects.models));
+    println!(
+        "  max tokens: {}",
+        effects
+            .max_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".into())
+    );
+    ExitCode::SUCCESS
+}
+
+fn fmt_list(xs: &[String]) -> String {
+    if xs.is_empty() {
+        "∅ (deny-all)".to_string()
+    } else {
+        xs.join(", ")
+    }
 }
 
 fn run_types() -> ExitCode {

@@ -167,6 +167,46 @@ export type Runbook = {
   prerequisites: Section<UnorderedList | TaskList>
   steps: Section<OrderedList>
 }
+
+// ---------------------------------------------------------------------------
+// Effect rows.
+//
+// These are intersected into a document's declared type to encode the
+// *capabilities* the prompt is authorized to exercise at runtime. They
+// are structurally `any` — the type checker extracts them in a separate
+// pass (`td-check::effects`) rather than treating them as content fields.
+//
+//   type Doc =
+//     & Prompt<In, Out>
+//     & Uses<["read_file", "run_tests"]>
+//     & Reads<["./src/**"]>
+//     & Writes<[]>
+//     & Model<"claude-opus-4-5" | "claude-sonnet-4-5">
+//     & MaxTokens<4096>
+//
+// The compiled JSON Schema carries them under `x-typedown-effects`, and
+// the `td-runtime` crate turns the declared set into enforced behavior.
+// ---------------------------------------------------------------------------
+
+/// Tools this prompt is authorized to invoke. Pass a tuple of tool-name
+/// string literals: `Uses<["read_file", "run_tests"]>`. The empty tuple
+/// `Uses<[]>` declares "no tools permitted."
+export type Uses<T> = any
+
+/// Filesystem / resource patterns this prompt may read. Entries are glob
+/// strings: `Reads<["./src/**", "./docs/*.md"]>`.
+export type Reads<T> = any
+
+/// Filesystem / resource patterns this prompt may write. `Writes<[]>`
+/// declares an explicitly read-only prompt.
+export type Writes<T> = any
+
+/// Models this prompt has been validated against. Accepts a tuple of
+/// string literals or a string-literal union for the variadic case.
+export type Model<T> = any
+
+/// Hard token ceiling honored by the runtime.
+export type MaxTokens<N> = any
 "#;
 
 const DOCS_SRC: &str = r#"

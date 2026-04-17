@@ -276,8 +276,8 @@ r.
 #[test]
 fn schema_export_roundtrips_example_shape() {
     let file = SourceFile::new("doc.md", GOOD_TYPED_EXAMPLE.to_string());
-    let (_doc, env, ty, _diags) = resolve_doc_type(&file);
-    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"));
+    let (_doc, env, ty, effects, _diags) = resolve_doc_type(&file);
+    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects));
     assert_eq!(schema["title"], serde_json::json!("Doc"));
     assert_eq!(schema["type"], serde_json::json!("object"));
     // Prompt<In, Out> expands to { role, instructions, examples }.
@@ -290,8 +290,8 @@ fn schema_export_roundtrips_example_shape() {
 #[test]
 fn schema_export_includes_local_defs() {
     let file = SourceFile::new("doc.md", GOOD_TYPED_EXAMPLE.to_string());
-    let (_doc, env, ty, _diags) = resolve_doc_type(&file);
-    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"));
+    let (_doc, env, ty, effects, _diags) = resolve_doc_type(&file);
+    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects));
     let defs = schema["$defs"].as_object().expect("$defs on root");
     // Both user-declared types should surface as usable value schemas.
     let in_schema = &defs["In"];
@@ -300,4 +300,75 @@ fn schema_export_includes_local_defs() {
     let out_schema = &defs["Out"];
     assert_eq!(out_schema["properties"]["severity"]["enum"],
         serde_json::json!(["nit", "suggestion", "blocking"]));
+}
+
+// ---------------------------------------------------------------------------
+// Effect rows: capability types in the doc's declared type flow through
+// check, schema, and runtime without touching conformance rules.
+// ---------------------------------------------------------------------------
+
+const PROMPT_WITH_EFFECTS: &str = r#"---
+typedown: Doc
+---
+
+# Reviewer
+
+```td
+import { Prompt, Uses, Reads, Writes, Model, MaxTokens } from "typedown/agents"
+
+type In  = { diff: string }
+type Out = { approved: boolean }
+
+export type Doc =
+  & Prompt<In, Out>
+  & Uses<["read_file", "run_tests"]>
+  & Reads<["./src/**", "./tests/**"]>
+  & Writes<[]>
+  & Model<"claude-opus-4-5">
+  & MaxTokens<4096>
+```
+
+## Role
+r.
+
+## Instructions
+1. x
+
+## Examples
+
+### Example 1
+
+**Input:** hi
+
+**Output:** hi
+"#;
+
+#[test]
+fn effect_rows_do_not_break_conformance() {
+    let codes = check("effects.md", PROMPT_WITH_EFFECTS);
+    assert!(codes.is_empty(), "expected clean, got {codes:?}");
+}
+
+#[test]
+fn effects_land_in_exported_schema() {
+    let file = SourceFile::new("e.md", PROMPT_WITH_EFFECTS.to_string());
+    let (_doc, env, ty, effects, _diags) = resolve_doc_type(&file);
+    assert!(effects.declared, "effects should be marked declared");
+    assert_eq!(effects.uses, vec!["read_file".to_string(), "run_tests".into()]);
+    assert_eq!(effects.writes, Vec::<String>::new());
+    assert_eq!(effects.max_tokens, Some(4096));
+    let schema = to_json_schema(&ty.expect("doc type"), &env, Some("Doc"), Some(&effects));
+    let x = &schema["x-typedown-effects"];
+    assert_eq!(x["uses"], serde_json::json!(["read_file", "run_tests"]));
+    assert_eq!(x["reads"], serde_json::json!(["./src/**", "./tests/**"]));
+    assert_eq!(x["writes"], serde_json::json!([]));
+    assert_eq!(x["model"], serde_json::json!(["claude-opus-4-5"]));
+    assert_eq!(x["maxTokens"], serde_json::json!(4096));
+}
+
+#[test]
+fn malformed_effect_row_fires_td601() {
+    let src = PROMPT_WITH_EFFECTS.replace("MaxTokens<4096>", "MaxTokens<\"4096\">");
+    let codes = check("bad_effect.md", &src);
+    assert!(codes.contains(&"td601".to_string()), "codes: {codes:?}");
 }

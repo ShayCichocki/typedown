@@ -148,6 +148,35 @@ pub fn check_value(
             ),
         },
 
+        // Tuple = positional array of fixed length & per-slot types.
+        TdType::Tuple { elems, .. } => match value {
+            Value::Array(items) => {
+                if items.len() != elems.len() {
+                    push_mismatch(
+                        diagnostics,
+                        file,
+                        anchor,
+                        path,
+                        &format!("tuple of length {}", elems.len()),
+                        &format!("array of length {}", items.len()),
+                    );
+                    return;
+                }
+                for (i, (item, ty)) in items.iter().zip(elems.iter()).enumerate() {
+                    let child = push_path(path, &i.to_string());
+                    check_value(item, ty, env, file, anchor, &child, diagnostics);
+                }
+            }
+            _ => push_mismatch(
+                diagnostics,
+                file,
+                anchor,
+                path,
+                "tuple",
+                &value_kind(value),
+            ),
+        },
+
         TdType::Object(obj) => check_object(obj, value, env, file, anchor, path, diagnostics),
 
         // A union passes if ANY variant passes. We try each variant into a
