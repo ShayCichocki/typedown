@@ -73,8 +73,39 @@ crates/
 
 ```sh
 cargo run -p td-cli -- check examples/
-cargo run -p td-cli -- types        # print stdlib modules
+cargo run -p td-cli -- types                         # print stdlib modules
+cargo run -p td-cli -- export examples/foo.md        # JSON Schema → stdout
+cargo run -p td-cli -- export examples/foo.md -o out.json
 ```
+
+## Typed example values
+
+`Example<I, O>` is now load-bearing. Write your examples with `json` or
+`yaml` value fences and typedown type-checks the payloads against `I` / `O`:
+
+````md
+### Example 1
+
+**Input:**
+
+```json
+{ "diff": "...", "context": "src/auth.ts" }
+```
+
+**Output:**
+
+```yaml
+approved: false
+comments:
+  - file: src/auth.ts
+    line: 42
+    severity: blocking
+    body: null check missing
+```
+````
+
+Prose-only examples (no value fences) continue to work — value typing is
+strictly opt-in.
 
 ## Diagnostic codes
 
@@ -91,6 +122,9 @@ cargo run -p td-cli -- types        # print stdlib modules
 | td403  | error    | unknown type referenced in declaration           |
 | td404  | error    | document type must be an object                  |
 | td405  | warning  | undeclared section present in document           |
+| td501  | error    | value fence failed to parse (JSON / YAML syntax) |
+| td502  | error    | value does not match declared type               |
+| td504  | warning  | value has extra field not declared in the type   |
 
 ## Stdlib
 
@@ -105,15 +139,22 @@ Plus implicit content-shape primitives usable without import:
 
 ## Status
 
-Vertical slice is shipping today:
+Shipping today:
 - Markdown + td-DSL parsing
 - Generic instantiation & intersection flattening
-- Full conformance check for the `Prompt<I, O>` shape
+- Full conformance check for `Prompt<I, O>` and `Readme` / `AgentsMd`
+- **Value typing**: JSON / YAML fences inside `Example<I, O>` are parsed
+  and checked against `I` / `O` — generic parameters are no longer phantom
+- **Schema export**: `typedown export` emits JSON Schema (Draft 2020-12)
+  with every local type declaration under `$defs`
 - CLI with miette diagnostics
 
 Roadmap:
+- Effect / capability types (`Uses<>`, `Reads<>`, `Writes<>`) for agent
+  prompt policy
+- `td diff` for semver-style compatibility checks between doc versions
+- Additional export targets (`.d.ts`, Zod, OpenAI / Anthropic tool JSON)
 - LSP server (`td-lsp`) for in-editor diagnostics
-- JSON value validation inside `Example<I, O>` code fences
 - User-authored `.td` modules via import paths
 - Executable code-fence checking (tsc / rustc / shellcheck on blocks)
 - Watch mode, incremental parsing, formatter

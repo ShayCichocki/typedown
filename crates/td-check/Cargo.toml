@@ -11,4 +11,6 @@ td-core = { workspace = true }
 td-ast = { workspace = true }
 td-parse = { workspace = true }
 td-stdlib = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }

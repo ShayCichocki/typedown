@@ -23,7 +23,19 @@ You should just eyeball things and see what looks off.
 
 ## Examples
 
-Just wing it, bro.
+### Example 1
+
+**Input:**
+
+```json
+{ "diff": 42 }
+```
+
+**Output:**
+
+```json
+{ "approved": "yes", "extra": "oops" }
+```
 
 ## Random Thoughts
 

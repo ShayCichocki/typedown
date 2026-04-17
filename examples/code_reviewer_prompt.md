@@ -48,7 +48,43 @@ structured JSON matching the declared output schema.
 
 ### Example 1
 
-**Input:** the agent receives a small TypeScript diff with a null-check bug.
+**Input:**
 
-**Output:** the agent returns `approved: false` and a single `blocking`
-comment pointing at the missing guard.
+```json
+{
+  "diff": "-  return user.email;\n+  return user?.email ?? null;",
+  "context": "src/auth/user.ts"
+}
+```
+
+**Output:**
+
+```json
+{
+  "approved": false,
+  "comments": [
+    {
+      "file": "src/auth/user.ts",
+      "line": 42,
+      "severity": "blocking",
+      "body": "`user` is possibly undefined; add a guard before dereferencing."
+    }
+  ]
+}
+```
+
+### Example 2
+
+**Input:**
+
+```yaml
+diff: "-const MAX = 5;\n+const MAX = 10;"
+context: "src/config.ts"
+```
+
+**Output:**
+
+```yaml
+approved: true
+comments: []
+```

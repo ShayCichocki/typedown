@@ -29,6 +29,7 @@ use td_core::{Diagnostics, Severity, SourceFile, Span, TdDiagnostic};
 use td_stdlib::Builtin;
 
 use crate::env::{LookupResult, TypeEnv};
+use crate::value::{check_value, parse_value, VALUE_FENCE_LANGS};
 
 pub fn check_doc(
     doc: &MdDoc,
@@ -424,7 +425,7 @@ fn check_builtin(
     field_name: &str,
     heading_node: &MdNode,
     body: &[MdNode],
-    _env: &TypeEnv,
+    env: &TypeEnv,
     file: &SourceFile,
     diagnostics: &mut Diagnostics,
     ref_span: Span,
@@ -508,32 +509,29 @@ fn check_builtin(
         }
         Builtin::Example => {
             // Example<I, O> at body level == { input: I, output: O }.
-            // Structural check: require "Input" and "Output" markers.
-            let text_haystack: String = body
-                .iter()
-                .filter_map(|n| match &n.kind {
-                    Paragraph { text } => Some(text.as_str()),
-                    BlockQuote { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text_haystack.to_ascii_lowercase().contains("input") {
-                diagnostics.push(shape_error(
-                    field_name,
-                    "an `Input:` marker followed by the input value",
-                    heading_node,
-                    file,
-                ));
-            }
-            if !text_haystack.to_ascii_lowercase().contains("output") {
-                diagnostics.push(shape_error(
-                    field_name,
-                    "an `Output:` marker followed by the output value",
-                    heading_node,
-                    file,
-                ));
-            }
+            //
+            // We run *two* checks here, in order:
+            //
+            //   1. Structural. The body must mention `Input` and `Output`,
+            //      either as prose markers ("**Input:** …") or as a typed
+            //      value fence labeled with the nearest marker. This keeps
+            //      prose-only examples working unchanged (backward compat
+            //      with v0) while enabling value typing when authors opt in.
+            //
+            //   2. Value-level. For every ```json / ```yaml fence we can
+            //      associate with an Input or Output marker, we type-check
+            //      the parsed value against I or O respectively. This is
+            //      what turns `Example<I, O>`'s type parameters from phantom
+            //      into load-bearing.
+            check_example_body(
+                type_args,
+                field_name,
+                heading_node,
+                body,
+                env,
+                file,
+                diagnostics,
+            );
         }
     }
 }
@@ -651,6 +649,171 @@ fn pick_anchor(span: Span, fallback: Span, content: &str) -> Span {
         span
     } else {
         fallback
+    }
+}
+
+/// Which role a value fence plays in an `### Example N` subsection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ExampleSlot {
+    Input,
+    Output,
+}
+
+/// Full conformance check for a single `### Example N` body against the
+/// declared `Example<I, O>` type args.
+///
+/// The pairing rule: walk the body in order. Paragraphs containing
+/// "Input"/"Output" flip the current slot. Every subsequent value fence
+/// (lang ∈ [`VALUE_FENCE_LANGS`]) is parsed and type-checked against
+/// whichever of `I` / `O` the current slot points at. A fence appearing
+/// before any marker is treated as Input (common pattern: fence-first
+/// examples). Prose examples with no value fences continue to pass as
+/// long as the markers exist — the v0 behavior — so adopting typed
+/// values is a strictly-opt-in upgrade.
+fn check_example_body(
+    type_args: &[TdType],
+    field_name: &str,
+    heading_node: &MdNode,
+    body: &[MdNode],
+    env: &TypeEnv,
+    file: &SourceFile,
+    diagnostics: &mut Diagnostics,
+) {
+    use MdNodeKind::*;
+
+    let input_ty = type_args.first();
+    let output_ty = type_args.get(1);
+
+    // Scan for markers + value fences and pair them up.
+    let mut seen_input_marker = false;
+    let mut seen_output_marker = false;
+    let mut current_slot: Option<ExampleSlot> = None;
+    let mut input_value_seen = false;
+    let mut output_value_seen = false;
+
+    for node in body {
+        match &node.kind {
+            Paragraph { text } | BlockQuote { text } => {
+                let lower = text.to_ascii_lowercase();
+                // Detect markers. We require the word to appear near a
+                // colon to avoid false positives in prose ("the input…").
+                let has_input_marker = has_marker(&lower, "input");
+                let has_output_marker = has_marker(&lower, "output");
+                if has_input_marker {
+                    seen_input_marker = true;
+                    current_slot = Some(ExampleSlot::Input);
+                }
+                if has_output_marker {
+                    seen_output_marker = true;
+                    current_slot = Some(ExampleSlot::Output);
+                }
+                // Also accept loose mentions (not colon-adjacent) as a
+                // marker hit for the structural check only, preserving v0
+                // behavior where any "input" substring sufficed.
+                if !has_input_marker && lower.contains("input") {
+                    seen_input_marker = true;
+                }
+                if !has_output_marker && lower.contains("output") {
+                    seen_output_marker = true;
+                }
+            }
+            CodeBlock { lang, code } => {
+                let Some(l) = lang.as_deref() else { continue };
+                if !VALUE_FENCE_LANGS.contains(&l) {
+                    continue;
+                }
+                let slot = current_slot.unwrap_or(ExampleSlot::Input);
+                let ty = match slot {
+                    ExampleSlot::Input => input_ty,
+                    ExampleSlot::Output => output_ty,
+                };
+                match slot {
+                    ExampleSlot::Input => input_value_seen = true,
+                    ExampleSlot::Output => output_value_seen = true,
+                }
+                // Parse.
+                let value = match parse_value(l, code) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        diagnostics.push(TdDiagnostic::error(
+                            "td501",
+                            format!(
+                                "failed to parse `{l}` {slot_label} value in example `{}`: {err}",
+                                pretty(field_name),
+                                slot_label = slot_label(slot),
+                            ),
+                            file,
+                            node.span,
+                            "malformed value",
+                        ).with_help(
+                            "check the JSON / YAML syntax of this code fence".to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                // Typecheck (if we have a type arg for this slot).
+                if let Some(ty) = ty {
+                    let path_prefix = slot_label(slot); // "input" / "output"
+                    check_value(
+                        &value,
+                        ty,
+                        env,
+                        file,
+                        node.span,
+                        &format!("/{path_prefix}"),
+                        diagnostics,
+                    );
+                }
+                // After a value fence we reset the slot so a later fence
+                // without a marker is treated as "no slot" rather than
+                // re-binding to the last one. This avoids silently
+                // double-counting an unlabeled fence.
+                current_slot = None;
+            }
+            _ => {}
+        }
+    }
+
+    // Structural gate: every Example must reference both Input and Output,
+    // either through prose markers or through value fences. Value-fence
+    // presence implies a marker was seen (otherwise the slot defaulted to
+    // Input, which handles the fence-first case above).
+    if !(seen_input_marker || input_value_seen) {
+        diagnostics.push(shape_error(
+            field_name,
+            "an `Input:` marker followed by the input value",
+            heading_node,
+            file,
+        ));
+    }
+    if !(seen_output_marker || output_value_seen) {
+        diagnostics.push(shape_error(
+            field_name,
+            "an `Output:` marker followed by the output value",
+            heading_node,
+            file,
+        ));
+    }
+}
+
+/// Match "input" / "output" as a field-style marker (`**Input:** …`,
+/// `Input -`, `Input —`). Bare occurrences of the word in prose aren't
+/// treated as a marker but are still counted as a structural mention
+/// elsewhere for v0 compatibility.
+fn has_marker(text_lower: &str, word: &str) -> bool {
+    let Some(pos) = text_lower.find(word) else {
+        return false;
+    };
+    // Look for a colon or dash within a few chars after the word.
+    let after = &text_lower[pos + word.len()..];
+    let probe: String = after.chars().take(4).collect();
+    probe.contains(':') || probe.contains('-') || probe.contains('—')
+}
+
+fn slot_label(slot: ExampleSlot) -> &'static str {
+    match slot {
+        ExampleSlot::Input => "input",
+        ExampleSlot::Output => "output",
     }
 }
 

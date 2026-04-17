@@ -19,3 +19,4 @@ td-stdlib = { workspace = true }
 clap = { workspace = true }
 miette = { workspace = true }
 ignore = { workspace = true }
+serde_json = { workspace = true }
