@@ -35,7 +35,7 @@ pub mod value;
 
 pub use compose::{split_compose, Composition, ComposedStep};
 pub use effects::{collect_effects, split_effects, Effects};
-pub use env::{LookupResult, TypeEnv};
+pub use env::{EntryOrigin, EnvEntry, LookupResult, TypeEnv};
 pub use schema::{to_json_schema, to_subschema};
 pub use value::{check_value, parse_value, VALUE_FENCE_LANGS};
 

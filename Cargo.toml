@@ -7,6 +7,7 @@ members = [
     "crates/td-check",
     "crates/td-stdlib",
     "crates/td-cli",
+    "crates/td-codegen",
     "crates/td-runtime",
 ]
 
@@ -26,6 +27,7 @@ td-parse = { path = "crates/td-parse" }
 td-check = { path = "crates/td-check" }
 td-stdlib = { path = "crates/td-stdlib" }
 td-runtime = { path = "crates/td-runtime" }
+td-codegen = { path = "crates/td-codegen" }
 
 # parsing
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

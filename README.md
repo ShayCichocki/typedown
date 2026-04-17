@@ -105,6 +105,8 @@ crates/
   td-runtime/  EnforcedPrompt: refuse unauthorized tool calls / reads / writes
                at runtime from a typed-markdown contract; expose pipeline
                structure to orchestrators
+  td-codegen/  compile typed docs to runtime code (Vercel AI SDK
+               backend — TypeScript + Zod — today)
   td-cli/      `typedown` binary: check / types / export / effects / pipeline
 ```
 
@@ -115,6 +117,7 @@ cargo run -p td-cli -- check examples/
 cargo run -p td-cli -- types                             # print stdlib modules
 cargo run -p td-cli -- export examples/foo.md            # JSON Schema → stdout
 cargo run -p td-cli -- export examples/foo.md -o out.json
+cargo run -p td-cli -- export --format ai-sdk examples/foo.md -o foo.ts
 cargo run -p td-cli -- effects examples/foo.md           # print the policy
 cargo run -p td-cli -- effects examples/foo.md --json
 cargo run -p td-cli -- pipeline examples/pipeline.md     # print pipeline steps
@@ -218,6 +221,47 @@ Schema export embeds the full pipeline as an `x-typedown-pipeline`
 vendor extension alongside `x-typedown-effects`, so orchestrators
 (AI SDK codegen, Workflow DevKit, a custom runner) get stepwise I/O +
 per-step policy in one document.
+
+## Compiling to runtime code — Vercel AI SDK
+
+Typedown documents compile to executable TypeScript targeting the
+[Vercel AI SDK](https://ai-sdk.dev). One `.md` file becomes a ready-to-
+import module with:
+
+* A **Zod schema** and inferred TypeScript type for every declared
+  value-shape type (topologically sorted so forward references are
+  impossible).
+* A **policy constant** derived from the effect rows — the same
+  capability data `td-runtime` enforces server-side.
+* The rendered **system prompt** as a template string (markdown body
+  minus the `td` fences).
+* An **async invocation function** wrapping `generateText` with
+  structured output (`Output.object({ schema })`) and runtime tool
+  allowlist filtering.
+
+```sh
+typedown export --format ai-sdk prompts/reviewer.md -o generated/reviewer.ts
+```
+
+```ts
+// consumer code — three lines
+import { codeReviewerPrompt } from "@/generated/reviewer";
+const result = await codeReviewerPrompt({ diff, context });
+```
+
+The generated module is plain TypeScript — no runtime dependency on
+typedown or Rust. If you've got AI SDK + Zod installed, it works. The
+compile target preserves every constraint the type system verified:
+
+* `allowedTools` const is a `readonly` string-literal tuple TypeScript
+  can exhaustively check at compile time.
+* `Model<"a" | "b">` becomes `allowedModels: ["a", "b"]` with `model`
+  defaulting to the first member.
+* `Writes<[]>` emits `writes: []` — the same deny-all signal the
+  runtime honors.
+* Codegen **refuses to run** if the document wouldn't pass `typedown
+  check`. Shipping TS generated from a broken contract just moves the
+  failure downstream.
 
 ## Effect rows — prompts as contracts
 
@@ -347,10 +391,16 @@ Shipping today:
   calls, reads, writes, models, and over-budget token requests;
   validates concrete JSON I/O against `I` and `O`; exposes pipeline
   structure for orchestrators
+- **`td-codegen`**: `typedown export --format ai-sdk` compiles typed
+  prompts to ready-to-import Vercel AI SDK TypeScript modules (Zod
+  schemas, policy constants, tool allowlist filtering, `generateText`
+  wrapper) — no hand-written boilerplate
 - CLI: `check` / `types` / `export` / `effects` / `pipeline`
 
 Roadmap:
-- AI SDK / Workflow DevKit / Anthropic tool JSON compile targets
+- Pipeline codegen (emit orchestrator functions from `Compose<[…]>`)
+- Additional codegen backends: Workflow DevKit, Anthropic tool JSON,
+  OpenAI function specs, Pydantic
 - `td diff` for semver-style compatibility checks between doc versions
 - Additional export targets (`.d.ts`, Zod, OpenAI / Anthropic tool JSON)
 - Reference Anthropic / OpenAI client wrappers that consume `EnforcedPrompt`

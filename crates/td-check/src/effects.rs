@@ -111,25 +111,39 @@ pub fn collect_effects(
 }
 
 /// Walk one layer of aliases: if `ty` is a NamedRef to a user decl (NOT a
-/// builtin or effect marker), expand it once. Repeat until we hit a
-/// non-alias type, a built-in, or an effect marker. This is *not* full
-/// generic instantiation — it's the minimal unwrap needed to reach the
-/// underlying intersection.
+/// builtin, effect marker, or content-shape marker), expand it once.
+/// Repeat until we hit a non-alias type or a structural stop-name.
+///
+/// **Why stop at content-shape markers?** `Prompt<I, O>`, `Readme`, etc.
+/// resolve to an object body that *hides the NamedRef*. Downstream
+/// codegen, IDE hover, and the runtime want to see the `Prompt`
+/// reference, not its opaque expanded shape. We stop the walk there;
+/// `flatten_to_object` still expands through NamedRefs when it needs
+/// to for content conformance.
 fn resolve_alias(ty: &TdType, env: &TypeEnv) -> TdType {
     let mut current = ty.clone();
-    // Bound the loop to prevent pathological cycles; six levels is far more
-    // than any real document declares.
     for _ in 0..6 {
         let TdType::NamedRef {
-            name, type_args, ..
+            name, ..
         } = &current
         else {
             break;
         };
-        // Don't unwrap builtins or effect markers.
+        // Don't unwrap effect markers.
         if effect_kind(&current).is_some() {
             break;
         }
+        // Don't unwrap content-shape markers; their expansion loses
+        // information downstream consumers need.
+        if is_content_shape_name(name) {
+            break;
+        }
+        let TdType::NamedRef {
+            name, type_args, ..
+        } = &current
+        else {
+            unreachable!()
+        };
         match env.lookup(name) {
             LookupResult::Decl(entry) => {
                 current = env.instantiate(&entry.decl, type_args);
@@ -138,6 +152,29 @@ fn resolve_alias(ty: &TdType, env: &TypeEnv) -> TdType {
         }
     }
     current
+}
+
+/// Names of stdlib types whose bodies are opaque *structural markers* —
+/// NamedRefs we don't peel because their content-shape expansion would
+/// lose the information downstream passes (codegen, IDE hover,
+/// td-runtime's I/O extraction) need to identify them.
+fn is_content_shape_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Prompt"
+            | "Tool"
+            | "Runbook"
+            | "Readme"
+            | "AgentsMd"
+            | "Section"
+            | "Prose"
+            | "OrderedList"
+            | "UnorderedList"
+            | "TaskList"
+            | "CodeBlock"
+            | "Heading"
+            | "Example"
+    )
 }
 
 // ---------------------------------------------------------------------------

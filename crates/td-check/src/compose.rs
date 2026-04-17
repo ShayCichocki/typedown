@@ -194,23 +194,30 @@ fn is_compose(name: &str) -> bool {
     matches!(name, "Compose" | "Sequential")
 }
 
-/// Expand user aliases one step at a time until we hit a non-alias type,
-/// a stdlib builtin (including the `Compose`/effect-row markers), or run
-/// out of budget. Mirrors `effects::resolve_alias` — should probably be
-/// factored into a shared helper once we add a third consumer.
+/// Expand user aliases one step at a time until we hit a non-alias type
+/// or a stop-name (Compose, effect row, or content-shape marker like
+/// `Prompt`). Content-shape markers have opaque object bodies that
+/// hide the NamedRef downstream consumers need to identify.
 fn resolve_alias(ty: &TdType, env: &TypeEnv) -> TdType {
     let mut current = ty.clone();
     for _ in 0..6 {
+        let TdType::NamedRef { name, .. } = &current else {
+            break;
+        };
+        // Stop on compose markers; they're meta, not aliases.
+        if is_compose(name) {
+            break;
+        }
+        // Stop on content-shape markers for the same reason.
+        if is_content_shape_name(name) {
+            break;
+        }
         let TdType::NamedRef {
             name, type_args, ..
         } = &current
         else {
-            break;
+            unreachable!()
         };
-        // Stop on compose markers; they're meta, not aliases to unwrap.
-        if is_compose(name) {
-            break;
-        }
         match env.lookup(name) {
             LookupResult::Decl(entry) => {
                 current = env.instantiate(&entry.decl, type_args);
@@ -219,6 +226,25 @@ fn resolve_alias(ty: &TdType, env: &TypeEnv) -> TdType {
         }
     }
     current
+}
+
+fn is_content_shape_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Prompt"
+            | "Tool"
+            | "Runbook"
+            | "Readme"
+            | "AgentsMd"
+            | "Section"
+            | "Prose"
+            | "OrderedList"
+            | "UnorderedList"
+            | "TaskList"
+            | "CodeBlock"
+            | "Heading"
+            | "Example"
+    )
 }
 
 /// Extract the tuple of step types from the `Compose<T>` argument.
