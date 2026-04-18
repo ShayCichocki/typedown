@@ -15,7 +15,7 @@ members = [
 version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/anomalyco/typedown"
+repository = "https://github.com/ShayCichocki/typedown"
 authors = ["typedown contributors"]
 rust-version = "1.80"
 
