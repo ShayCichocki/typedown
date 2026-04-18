@@ -580,9 +580,24 @@ dependencies = [
  "serde_json",
  "td-ast",
  "td-check",
+ "td-codegen",
  "td-core",
  "td-parse",
  "td-stdlib",
+]
+
+[[package]]
+name = "td-codegen"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "td-ast",
+ "td-check",
+ "td-core",
+ "td-parse",
+ "td-stdlib",
+ "thiserror",
 ]
 
 [[package]]

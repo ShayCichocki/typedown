@@ -82,6 +82,9 @@ enum Cmd {
 enum ExportFormat {
     /// JSON Schema Draft 2020-12.
     JsonSchema,
+    /// Vercel AI SDK TypeScript module (`generateText` with structured
+    /// output, Zod schemas for every declared type, policy constants).
+    AiSdk,
 }
 
 fn main() -> ExitCode {
@@ -143,6 +146,19 @@ fn run_check(roots: Vec<PathBuf>) -> ExitCode {
 }
 
 fn run_export(path: PathBuf, format: ExportFormat, out: Option<PathBuf>) -> ExitCode {
+    // AI SDK codegen goes through its own strict-check path: we refuse
+    // to emit runtime code for any document that wouldn't pass
+    // `typedown check`, because shipping generated code against a
+    // broken contract just moves the blast radius downstream. The
+    // JSON-schema path is more permissive — users sometimes want a
+    // schema out of a work-in-progress doc.
+    match format {
+        ExportFormat::JsonSchema => run_export_json_schema(path, out),
+        ExportFormat::AiSdk => run_export_ai_sdk(path, out),
+    }
+}
+
+fn run_export_json_schema(path: PathBuf, out: Option<PathBuf>) -> ExitCode {
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
@@ -176,26 +192,50 @@ fn run_export(path: PathBuf, format: ExportFormat, out: Option<PathBuf>) -> Exit
         return ExitCode::from(2);
     };
 
-    let rendered = match format {
-        ExportFormat::JsonSchema => {
-            let title = path.file_stem().and_then(|s| s.to_str()).map(str::to_string);
-            let schema = to_json_schema(
-                &ty,
-                &env,
-                title.as_deref(),
-                Some(&effects),
-                composition.as_ref(),
-            );
-            match serde_json::to_string_pretty(&schema) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("failed to render schema: {e}");
-                    return ExitCode::from(2);
-                }
-            }
+    let title = path.file_stem().and_then(|s| s.to_str()).map(str::to_string);
+    let schema = to_json_schema(
+        &ty,
+        &env,
+        title.as_deref(),
+        Some(&effects),
+        composition.as_ref(),
+    );
+    let rendered = match serde_json::to_string_pretty(&schema) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to render schema: {e}");
+            return ExitCode::from(2);
         }
     };
+    write_or_print(out, rendered)
+}
 
+fn run_export_ai_sdk(path: PathBuf, out: Option<PathBuf>) -> ExitCode {
+    let loaded = match td_codegen::LoadedDoc::from_path(path.clone()) {
+        Ok(d) => d,
+        Err(td_codegen::LoadError::Io { source, .. }) => {
+            eprintln!("failed to read {}: {source}", path.display());
+            return ExitCode::from(2);
+        }
+        Err(td_codegen::LoadError::Check(diags)) => {
+            eprintln!("{}: typedown check failed; refusing to emit AI SDK code", path.display());
+            for d in diags {
+                eprintln!("  {d}");
+            }
+            return ExitCode::from(1);
+        }
+    };
+    let rendered = match td_codegen::ai_sdk::emit(&loaded.as_unit()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ai-sdk codegen failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    write_or_print(out, rendered)
+}
+
+fn write_or_print(out: Option<PathBuf>, rendered: String) -> ExitCode {
     match out {
         Some(out_path) => {
             if let Err(e) = fs::write(&out_path, rendered) {
