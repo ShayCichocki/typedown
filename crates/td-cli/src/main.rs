@@ -76,6 +76,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run the typedown Language Server over stdio.
+    ///
+    /// Intended to be spawned by an editor's generic LSP client. Speaks
+    /// JSON-RPC on stdin/stdout. Indexes every `.md` under the
+    /// initialize-param workspace roots and publishes diagnostics,
+    /// hover, completion, goto-definition, semantic tokens, and inlay
+    /// hints.
+    Lsp,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -95,6 +103,17 @@ fn main() -> ExitCode {
         Cmd::Export { path, format, out } => run_export(path, format, out),
         Cmd::Effects { path, json } => run_effects(path, json),
         Cmd::Pipeline { path, json } => run_pipeline(path, json),
+        Cmd::Lsp => run_lsp(),
+    }
+}
+
+fn run_lsp() -> ExitCode {
+    match td_lsp::run_stdio() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("typedown lsp: {e}");
+            ExitCode::from(2)
+        }
     }
 }
 
