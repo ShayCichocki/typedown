@@ -9,6 +9,7 @@ members = [
     "crates/td-cli",
     "crates/td-codegen",
     "crates/td-runtime",
+    "crates/td-lsp",
 ]
 
 [workspace.package]
@@ -28,6 +29,15 @@ td-check = { path = "crates/td-check" }
 td-stdlib = { path = "crates/td-stdlib" }
 td-runtime = { path = "crates/td-runtime" }
 td-codegen = { path = "crates/td-codegen" }
+td-lsp = { path = "crates/td-lsp" }
+
+# lsp
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "fs", "time"] }
+notify = "6"
+async-trait = "0.1"
+url = "2"
+percent-encoding = "2"
 
 # parsing
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

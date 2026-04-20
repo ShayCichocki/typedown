@@ -1,24 +1,27 @@
 [package]
-name = "td-cli"
+name = "td-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "typedown"
-path = "src/main.rs"
-
 [dependencies]
 td-core = { workspace = true }
 td-ast = { workspace = true }
 td-parse = { workspace = true }
 td-check = { workspace = true }
-td-codegen = { workspace = true }
 td-stdlib = { workspace = true }
-td-lsp = { workspace = true }
-clap = { workspace = true }
-miette = { workspace = true }
+
+tower-lsp = { workspace = true }
+tokio = { workspace = true }
+notify = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+percent-encoding = { workspace = true }
 ignore = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "sync", "fs", "io-util", "time"] }
